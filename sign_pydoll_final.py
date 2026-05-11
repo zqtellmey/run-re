@@ -67,20 +67,30 @@ def wxpush(content: str):
 
 ocr = ddddocr.DdddOcr(beta=True, show_ad=False)
 
-# ---------- 截图（使用 CDP 命令，无需 browser 连接）----------
+# ---------- 截图（使用 pydoll 内置方法 + CDP 备用）----------
 async def take_screenshot(browser, tab, name):
+    """使用 tab.take_screenshot() 或 execute_cdp_command 作为备用"""
     try:
-        result = await tab.execute("Page.captureScreenshot", {"format": "png"})
-        data = result.get("data", "")
-        if data:
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            path = SCREENSHOT_DIR / f"{ts}_{name}.png"
-            Path(path).write_bytes(base64.b64decode(data))
-            log.info(f"📸 截图: {path}")
-        else:
-            log.warning("截图返回空数据")
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = str(SCREENSHOT_DIR / f"{ts}_{name}.png")
+        await tab.take_screenshot(path=path)
+        log.info(f"📸 截图: {path}")
     except Exception as e:
-        log.warning(f"截图失败: {e}")
+        log.warning(f"截图失败(take_screenshot): {e}")
+        try:
+            # 备用方案：CDP 命令
+            result = await tab.execute_cdp_command(
+                "Page.captureScreenshot",
+                {"format": "png"}
+            )
+            data = result.get("data", "")
+            if data:
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                path = SCREENSHOT_DIR / f"{ts}_{name}.png"
+                Path(path).write_bytes(base64.b64decode(data))
+                log.info(f"📸 截图(CDP备用): {path}")
+        except Exception as e2:
+            log.warning(f"截图所有方案失败: {e2}")
 
 async def get_text(tab):
     try:
@@ -225,39 +235,82 @@ async def fill_captcha(tab):
         await asyncio.sleep(1)
     return ""
 
+# ---------- Cookie 恢复登录 ----------
+async def try_restore_cookies(tab):
+    cookies = load_cookies()
+    if not cookies:
+        return False
+
+    log.info(f"尝试恢复 {len(cookies)} 个 Cookie...")
+    await tab.go_to(BASE_URL)
+    await asyncio.sleep(2)
+
+    for c in cookies:
+        try:
+            await tab.set_cookie(
+                name=c["name"],
+                value=c["value"],
+                domain=c.get("domain", "run.freecloud.ltd"),
+                path=c.get("path", "/"),
+            )
+        except Exception as e:
+            log.debug(f"Cookie 设置失败 {c.get('name')}: {e}")
+
+    await tab.go_to(USER_CENTER)
+    await asyncio.sleep(3)
+
+    try:
+        url = await tab.execute_script("return window.location.href")
+        if isinstance(url, dict):
+            url = url.get("result", {}).get("result", {}).get("value", "")
+    except:
+        url = ""
+
+    if "/clientarea" in url and "login" not in url:
+        log.info("✅ Cookie 有效，恢复登录成功")
+        return True
+
+    log.info("Cookie 已失效，需重新登录")
+    return False
+
+# ---------- 登录成功后保存 Cookie ----------
+async def save_session_cookies(tab):
+    try:
+        # 方式1：pydoll 原生
+        cookies = await tab.get_cookies()
+    except:
+        cookies = []
+
+    if not cookies:
+        try:
+            # 方式2：CDP 命令
+            result = await tab.execute_cdp_command(
+                "Network.getCookies",
+                {"urls": [BASE_URL, LOGIN_URL, USER_CENTER]}
+            )
+            cookies = result.get("cookies", [])
+        except Exception as e:
+            log.warning(f"获取 Cookie 失败: {e}")
+            return
+
+    if cookies:
+        cookie_list = [{
+            "name": c.get("name", ""),
+            "value": c.get("value", ""),
+            "domain": c.get("domain", ""),
+            "path": c.get("path", "/"),
+            "secure": c.get("secure", False),
+        } for c in cookies if c.get("name") and c.get("value")]
+        save_cookies(cookie_list)
+        log.info(f"✅ 已保存 {len(cookie_list)} 个 Cookie")
+    else:
+        log.warning("未获取到任何 Cookie")
+
 # ---------- 登录 ----------
 async def login(browser, tab, max_retries=3):
-    cookies = load_cookies()
-    if cookies:
-        log.info("尝试用缓存的 Cookie 恢复登录...")
-        await tab.go_to(BASE_URL)
-        await asyncio.sleep(1)
-        for c in cookies:
-            try:
-                script = f"""
-                    (function() {{
-                        var cookie = {json.dumps(c['name'])} + "=" + {json.dumps(c['value'])};
-                        if ({json.dumps(c.get('domain', ''))}) cookie += ";domain=" + {json.dumps(c.get('domain', ''))};
-                        if ({json.dumps(c.get('path', ''))}) cookie += ";path=" + {json.dumps(c.get('path', ''))};
-                        if ({json.dumps(c.get('secure', False))}) cookie += ";secure";
-                        document.cookie = cookie;
-                    }})()
-                """
-                await tab.execute_script(script)
-            except:
-                pass
-        await tab.go_to(USER_CENTER)
-        await asyncio.sleep(3)
-        url_result = await tab.execute_script("return window.location.href")
-        if isinstance(url_result, dict):
-            url = url_result.get("result", {}).get("result", {}).get("value", "")
-        else:
-            url = str(url_result)
-        if "/clientarea" in url and "login" not in url:
-            log.info("✅ Cookie 有效，已恢复登录")
-            return True
-        else:
-            log.info("Cookie 失效，需要重新登录")
+    # 先尝试 Cookie 恢复
+    if await try_restore_cookies(tab):
+        return True
 
     for attempt in range(1, max_retries + 1):
         log.info(f"登录尝试 {attempt}/{max_retries}")
@@ -273,6 +326,7 @@ async def login(browser, tab, max_retries=3):
             if not await manual_cf_click(tab):
                 log.warning("Cloudflare 验证可能未完成")
 
+        # 填写邮箱
         email_el = None
         for selector in [
             {"tag_name": "input", "name": "email"},
@@ -286,7 +340,7 @@ async def login(browser, tab, max_retries=3):
                 continue
         if email_el:
             await email_el.click()
-            await email_el.type_text("")
+            await email_el.type_text("")  # 清空旧值
             await email_el.type_text(EMAIL, humanize=True)
         else:
             log.warning("未找到邮箱输入框")
@@ -294,6 +348,7 @@ async def login(browser, tab, max_retries=3):
 
         await human_delay()
 
+        # 填写密码
         pass_el = None
         for selector in [
             {"tag_name": "input", "name": "password"},
@@ -307,7 +362,7 @@ async def login(browser, tab, max_retries=3):
                 continue
         if pass_el:
             await pass_el.click()
-            await pass_el.type_text("")
+            await pass_el.type_text("")  # 清空旧值
             await pass_el.type_text(PASSWORD, humanize=True)
         else:
             log.warning("未找到密码输入框")
@@ -318,6 +373,7 @@ async def login(browser, tab, max_retries=3):
             log.warning("未能获取验证码，刷新重试")
             continue
 
+        # 点击登录
         try:
             login_btn = await tab.find(css="button.btn.btn-primary", timeout=10)
         except:
@@ -325,29 +381,18 @@ async def login(browser, tab, max_retries=3):
         await login_btn.click()
         await asyncio.sleep(5)
 
-        url_result = await tab.execute_script("return window.location.href")
-        if isinstance(url_result, dict):
-            url = url_result.get("result", {}).get("result", {}).get("value", "")
-        else:
-            url = str(url_result)
+        # 判断登录结果
+        try:
+            url = await tab.execute_script("return window.location.href")
+            if isinstance(url, dict):
+                url = url.get("result", {}).get("result", {}).get("value", "")
+        except:
+            url = ""
         log.info(f"当前 URL: {url}")
         if "/clientarea" in url:
             log.info("✅ 登录成功")
             await take_screenshot(browser, tab, "02_login_success")
-            try:
-                result = await tab.execute("Network.getCookies", {"urls": [BASE_URL, LOGIN_URL, USER_CENTER]})
-                cookie_list = [{
-                    "name": c["name"],
-                    "value": c["value"],
-                    "domain": c.get("domain", ""),
-                    "path": c.get("path", ""),
-                    "secure": c.get("secure", False),
-                } for c in result.get("cookies", [])]
-                if cookie_list:
-                    save_cookies(cookie_list)
-                    log.info(f"已保存 {len(cookie_list)} 个 Cookie")
-            except Exception as e:
-                log.warning(f"保存 Cookie 失败: {e}")
+            await save_session_cookies(tab)
             return True
 
         log.warning(f"登录失败，当前 URL: {url}")
