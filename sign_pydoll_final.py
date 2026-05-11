@@ -300,7 +300,14 @@ async def sign(browser, tab):
         elif op == '*': result = a * b
         elif op == '/': result = a / b if b != 0 else 0
         else: result = 0
-        result_str = str(int(result)) if result == int(result) else f"{result:.2f}"
+        # 整数直接取整；小数用真正四舍五入保留2位并去掉末尾多余的0
+        # Python 内置 round() 是银行家舍入（0.625->0.62），改用 math.floor 实现标准四舍五入
+        import math
+        if result == int(result):
+            result_str = str(int(result))
+        else:
+            rounded = math.floor(result * 100 + 0.5) / 100
+            result_str = f"{rounded:.2f}".rstrip("0").rstrip(".")
         ans_el = await tab.find(placeholder="请输入答案", timeout=5)
         await ans_el.click()
         await ans_el.type_text(result_str, humanize=True)
