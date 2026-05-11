@@ -1,12 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Runfreecloud 自动签到 + 续期
-代理策略：
-  1. 从免费API抓取国内(CN) socks5 代理
-  2. 并发测试每个代理能否访问目标网站 run.freecloud.ltd
-  3. 记录响应时间，取最快的5个
-  4. 依次用这5个代理尝试完整流程，第一个成功的即止
+Runfreecloud 自动签到 + 续期（代理版）
+修复：从登录页 HTML 中提取 base64 验证码，避免 403
 """
 
 import requests
@@ -14,6 +10,7 @@ import ddddocr
 import re
 import os
 import time
+import base64
 import logging
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -31,7 +28,7 @@ MANUAL_PROXIES: list[str] = [
 ]
 
 BASE_URL          = "https://run.freecloud.ltd"
-PROXY_TEST_URL    = "https://run.freecloud.ltd"   # 直接测目标网站
+PROXY_TEST_URL    = "https://run.freecloud.ltd"
 PROXY_TIMEOUT     = 10      # 单个代理测试超时（秒）
 PROXY_WORKERS     = 30      # 并发测试线程数
 TOP_N             = 5       # 取最快的N个代理
@@ -55,27 +52,23 @@ def fetch_cn_proxies() -> list[str]:
     proxies: set[str] = set()
 
     sources = [
-        # proxyscrape - 指定 CN
         (
             "https://api.proxyscrape.com/v3/free-proxy-list/get"
             "?request=displayproxies&protocol=socks5&timeout=5000"
             "&country=CN&simplified=true",
             "text"
         ),
-        # geonode - 指定 CN，按速度排序
         (
             "https://proxylist.geonode.com/api/proxy-list"
             "?limit=200&page=1&sort_by=speed&sort_type=asc"
             "&protocols=socks5&country=CN",
             "geonode"
         ),
-        # proxifly 综合列表（纯文本，后面按IP段过滤CN）
         (
             "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main"
             "/proxies/protocols/socks5/data.txt",
             "text"
         ),
-        # fate0 综合列表（每行JSON，过滤CN）
         (
             "https://cdn.jsdelivr.net/gh/fate0/proxylist@master/proxy.list",
             "fate0"
@@ -134,11 +127,6 @@ def fetch_cn_proxies() -> list[str]:
 # ──────────────────────────────────────────────────
 
 def test_one_proxy(proxy: str) -> tuple[str, float] | None:
-    """
-    测试单个代理：
-      - 能否访问目标网站 run.freecloud.ltd
-      - 返回 (proxy, 响应时间秒) 或 None（不可用）
-    """
     host, port = proxy.rsplit(":", 1)
     proxies = {
         "http":  f"socks5h://{host}:{port}",
@@ -153,7 +141,6 @@ def test_one_proxy(proxy: str) -> tuple[str, float] | None:
             allow_redirects=True,
         )
         elapsed = time.monotonic() - t0
-        # 目标站返回任意 HTTP 响应（含 403）都说明代理通了
         if r.status_code in (200, 301, 302, 403):
             return (proxy, elapsed)
     except Exception:
@@ -162,9 +149,6 @@ def test_one_proxy(proxy: str) -> tuple[str, float] | None:
 
 
 def get_top_proxies(candidates: list[str]) -> list[str]:
-    """
-    并发测试所有候选代理，按响应时间升序，返回最快的 TOP_N 个。
-    """
     if not candidates:
         return []
 
@@ -189,7 +173,7 @@ def get_top_proxies(candidates: list[str]) -> list[str]:
         log.warning("没有找到任何可用代理")
         return []
 
-    results.sort(key=lambda x: x[1])   # 按速度升序
+    results.sort(key=lambda x: x[1])
     top = results[:TOP_N]
 
     log.info("━" * 45)
@@ -231,49 +215,98 @@ class Bot:
         self.sess = make_session(proxy)
         self.ocr  = ddddocr.DdddOcr(show_ad=False)
 
-    # ── 登录 ──
+    # ── 登录（修复版） ──
     def _captcha(self) -> bytes:
-        r = self.sess.get(f"{BASE_URL}/captcha/api/math", timeout=15)
-        r.raise_for_status()
-        return r.content
+        """从登录页 HTML 中提取 base64 验证码图片，并保存到 /tmp 用于调试"""
+        r = self.sess.get(f"{BASE_URL}/login", timeout=15)
+        if r.status_code != 200:
+            with open("/tmp/login_page_error.html", "w", encoding="utf-8") as f:
+                f.write(r.text)
+            raise Exception(f"登录页返回 {r.status_code}")
+
+        # 正则提取 data:image 的 base64
+        match = re.search(
+            r'<img[^>]+src="data:image/[^;]+;base64,([^"]+)"',
+            r.text
+        )
+        if not match:
+            # 保存页面以供分析
+            with open("/tmp/login_page_no_captcha.html", "w", encoding="utf-8") as f:
+                f.write(r.text)
+            raise Exception("登录页中未找到验证码图片，请查看 /tmp/login_page_no_captcha.html")
+
+        img_b64 = match.group(1)
+        # 补齐可能缺失的 base64 填充
+        missing_padding = len(img_b64) % 4
+        if missing_padding:
+            img_b64 += '=' * (4 - missing_padding)
+        img_bytes = base64.b64decode(img_b64)
+
+        # 保存验证码图片（方便人工查看）
+        with open("/tmp/captcha_img.png", "wb") as f:
+            f.write(img_bytes)
+
+        return img_bytes
 
     def _ocr(self, img: bytes) -> str:
         raw   = self.ocr.classification(img)
         clean = re.sub(r"[^0-9a-zA-Z]", "", raw)
-        log.info(f"验证码：{raw!r} → {clean!r}")
+        log.info(f"验证码识别：{raw!r} → {clean!r}")
         return clean
 
     def login(self) -> bool:
         for i in range(1, MAX_LOGIN_RETRY + 1):
             log.info(f"登录 {i}/{MAX_LOGIN_RETRY}")
             try:
-                captcha = self._ocr(self._captcha())
+                captcha_img = self._captcha()
+                captcha_code = self._ocr(captcha_img)
+                log.info(f"识别结果: {captcha_code}")
+
+                # 再次请求登录页以获取 token（部分网站需要）
+                r = self.sess.get(f"{BASE_URL}/login", timeout=15)
+                token_match = re.search(r'name="token" value="([^"]+)"', r.text)
+                token = token_match.group(1) if token_match else ""
+
+                # 构造表单数据
+                payload = {
+                    "email": EMAIL,
+                    "password": PASSWORD,
+                    "captcha": captcha_code,
+                    "token": token,
+                }
+                # 提交登录
                 r = self.sess.post(
-                    f"{BASE_URL}/api/passport/auth/login",
-                    json={"email": EMAIL, "password": PASSWORD, "captcha": captcha},
+                    f"{BASE_URL}/login",
+                    data=payload,
+                    allow_redirects=True,
                     timeout=15,
                 )
-                token = (r.json().get("data") or {}).get("token")
-                if token:
-                    self.sess.headers.update({
-                        "Authorization": token,
-                        "auth-token":    token,
-                    })
+                # 判断登录成功
+                if "clientarea" in r.url or "用户中心" in r.text:
                     log.info("✅ 登录成功")
                     return True
-                log.warning(f"登录失败：{r.json().get('message', '未知')}")
+                else:
+                    log.warning(f"登录失败，状态码:{r.status_code}，URL:{r.url}")
+                    # 保存响应片段用于调试
+                    with open("/tmp/login_fail.html", "w", encoding="utf-8") as f:
+                        f.write(r.text[:2000])
             except Exception as e:
-                log.error(f"登录异常：{e}")
+                log.error(f"登录异常: {e}")
+                try:
+                    with open("/tmp/login_error.html", "w", encoding="utf-8") as f:
+                        f.write(r.text[:2000])
+                except:
+                    pass
             time.sleep(2)
         return False
 
-    # ── 签到 ──
+    # ── 签到（沿用原脚本逻辑） ──
     @staticmethod
     def _solve(expr: str) -> str:
         e = expr.replace(" ", "")
         if re.match(r"^[\d+\-*/().]+$", e):
             try:
-                v = eval(e)  # noqa: S307
+                v = eval(e)
                 if isinstance(v, float) and v == int(v):
                     return str(int(v))
                 return f"{v:.6f}".rstrip("0").rstrip(".")
@@ -308,7 +341,7 @@ class Bot:
             log.error(f"签到异常：{e}")
             return False
 
-    # ── 续期 ──
+    # ── 续期（沿用原脚本逻辑） ──
     def _services(self) -> list:
         for ep in [
             "/api/user/service/fetch",
@@ -421,7 +454,6 @@ def send_notify(title: str, body: str):
 
 
 def try_run(proxy: str | None) -> tuple[bool, list] | None:
-    """用指定代理跑完整流程，成功返回 (checkin_ok, renew_results)，登录失败返回 None"""
     bot = Bot(proxy=proxy)
     if not bot.login():
         return None
@@ -443,7 +475,7 @@ def main():
         candidates = list(MANUAL_PROXIES)
         if len(candidates) < TOP_N:
             candidates += fetch_cn_proxies()
-        candidates = list(dict.fromkeys(candidates))  # 去重
+        candidates = list(dict.fromkeys(candidates))
 
         top_proxies = get_top_proxies(candidates)
 
@@ -470,7 +502,6 @@ def main():
 
     checkin_ok, renew_results = result
 
-    # ── 汇总输出 ──
     lines = [f"📅 {datetime.now():%Y-%m-%d %H:%M}"]
     lines.append(f"{'✅' if checkin_ok else '❌'} 签到：{'成功' if checkin_ok else '失败'}")
     if renew_results:
