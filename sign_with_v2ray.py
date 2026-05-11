@@ -1,11 +1,16 @@
+import subprocess, sys
+try:
+    import undetected_chromedriver as uc
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "undetected-chromedriver"])
+    import undetected_chromedriver as uc
+
 import os
 import re
 import time
 import logging
 import traceback
 from datetime import datetime, timedelta
-
-import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
@@ -46,10 +51,11 @@ def get_driver():
     options.add_argument('--disable-gpu')
     options.add_argument('--window-size=1920,1080')
     options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-    # 代理，走 V2Ray socks5
     options.add_argument('--proxy-server=socks5://127.0.0.1:10808')
     driver = uc.Chrome(options=options)
     return driver
+
+# 下面的 login, sign, renew 等函数就直接复制你上一版本的完整内容，这里省略...
 
 # ---- 以下函数完全不变，直接从之前的脚本复制过来即可 ----
 def recognize_captcha(driver):
