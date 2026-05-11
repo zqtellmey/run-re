@@ -83,7 +83,7 @@ jobs:
           wait $RECORD_PID 2>/dev/null || true
           pkill Xvfb 2>/dev/null || true
 
-      # 🔥 新增：保存 Cookie 到缓存（无论脚本是否成功）
+      # 🔥 新增：保存 Cookie 到缓存
       - name: 缓存 Cookie 到 GitHub Actions
         if: always()
         uses: actions/cache@v4
