@@ -17,7 +17,7 @@ jobs:
       - name: 设置 Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'   # 用 3.12 更稳定
+          python-version: '3.12'
 
       - name: 安装系统依赖 (Chromium + ffmpeg + xvfb + 中文字体)
         run: |
@@ -43,13 +43,31 @@ jobs:
           curl -s --max-time 5 --socks5 127.0.0.1:10808 ifconfig.me
           echo ""
 
+      # 🔥 新增：恢复缓存的 Cookie（如果存在）
+      - name: 恢复 Cookie 缓存
+        id: restore-cookies
+        uses: actions/cache@v4
+        with:
+          path: ./cookies.json
+          key: runfreecloud-cookies-${{ github.ref_name }}
+          restore-keys: |
+            runfreecloud-cookies-
+
+      - name: 显示 Cookie 缓存状态
+        run: |
+          if [ -f cookies.json ]; then
+            echo "✅ 已恢复之前的登录 Cookie"
+          else
+            echo "ℹ️ 没有缓存的 Cookie，将要全新登录"
+          fi
+
       - name: 运行脚本 (带录屏)
         env:
           EMAIL: ${{ secrets.EMAIL }}
           PASSWORD: ${{ secrets.PASSWORD }}
           WXPUSHER_TOKEN: ${{ secrets.WXPUSHER_TOKEN }}
           WXPUSHER_UID: ${{ secrets.WXPUSHER_UID }}
-          HEADLESS: "false"          # 因为已有 xvfb，可以开无头
+          HEADLESS: "false"
           DISPLAY: ":99"
         run: |
           export DISPLAY=:99
@@ -60,11 +78,20 @@ jobs:
             -movflags +faststart /tmp/recording.mp4 &
           RECORD_PID=$!
           sleep 1
-          # 运行签到脚本（超时防止卡死）
           timeout 285 python sign_pydoll_final.py || echo "脚本退出码: $?"
           kill $RECORD_PID 2>/dev/null || true
           wait $RECORD_PID 2>/dev/null || true
           pkill Xvfb 2>/dev/null || true
+
+      # 🔥 新增：保存 Cookie 到缓存（无论脚本是否成功）
+      - name: 缓存 Cookie 到 GitHub Actions
+        if: always()
+        uses: actions/cache@v4
+        with:
+          path: ./cookies.json
+          key: runfreecloud-cookies-${{ github.ref_name }}-${{ github.run_id }}
+          restore-keys: |
+            runfreecloud-cookies-
 
       - name: 上传截图和录屏
         if: always()
