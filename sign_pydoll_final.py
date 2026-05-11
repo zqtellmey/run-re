@@ -16,7 +16,7 @@ USER_CENTER = f"{BASE_URL}/clientarea"
 SIGN_PAGE = f"{BASE_URL}/addons?_plugin=5&controller=index&action=index"
 
 # 截图目录：在GitHub Actions中自动使用工作区路径，本地运行时使用当前目录
-SCREENSHOT_DIR = Path(os.environ.get("GITHUB_WORKSPACE", ".")) / "screenshots"
+SCREENSHOT_DIR = Path("./screenshots")
 SCREENSHOT_DIR.mkdir(exist_ok=True)
 
 # ---------- Cookie 缓存 ----------
