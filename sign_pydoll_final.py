@@ -15,7 +15,7 @@ LOGIN_URL = f"{BASE_URL}/login"
 USER_CENTER = f"{BASE_URL}/clientarea"
 SIGN_PAGE = f"{BASE_URL}/addons?_plugin=5&controller=index&action=index"
 
-# 截图目录：在GitHub Actions中自动使用工作区路径，本地运行时使用当前目录
+# 截图目录
 SCREENSHOT_DIR = Path("./screenshots")
 SCREENSHOT_DIR.mkdir(exist_ok=True)
 
@@ -68,19 +68,13 @@ def wxpush(content: str):
 
 ocr = ddddocr.DdddOcr(beta=True, show_ad=False)
 
-# ---------- CDP 截图 ----------
+# ---------- 截图（改用 pydoll 自带方法）----------
 async def take_screenshot(browser, tab, name):
     try:
-        conn = getattr(browser, '_connection', None) or getattr(browser, 'connection', None)
-        if not conn:
-            return
-        result = await conn.execute("Page.captureScreenshot", {"format": "png"})
-        data = result.get("data", "")
-        if data:
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            path = SCREENSHOT_DIR / f"{ts}_{name}.png"
-            Path(path).write_bytes(base64.b64decode(data))
-            log.info(f"📸 截图: {path}")
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = SCREENSHOT_DIR / f"{ts}_{name}.png"
+        await tab.screenshot(str(path))
+        log.info(f"📸 截图: {path}")
     except Exception as e:
         log.warning(f"截图失败: {e}")
 
@@ -227,9 +221,8 @@ async def fill_captcha(tab):
         await asyncio.sleep(1)
     return ""
 
-# ---------- 登录（增加 Cookie 恢复）----------
+# ---------- 登录 ----------
 async def login(browser, tab, max_retries=3):
-    # 先尝试用缓存 Cookie 恢复登录
     cookies = load_cookies()
     if cookies:
         log.info("尝试用缓存的 Cookie 恢复登录...")
@@ -262,7 +255,6 @@ async def login(browser, tab, max_retries=3):
         else:
             log.info("Cookie 失效，需要重新登录")
 
-    # 否则进行全新登录
     for attempt in range(1, max_retries + 1):
         log.info(f"登录尝试 {attempt}/{max_retries}")
         try:
@@ -277,7 +269,6 @@ async def login(browser, tab, max_retries=3):
             if not await manual_cf_click(tab):
                 log.warning("Cloudflare 验证可能未完成")
 
-        # 填写邮箱
         email_el = None
         for selector in [
             {"tag_name": "input", "name": "email"},
@@ -291,7 +282,7 @@ async def login(browser, tab, max_retries=3):
                 continue
         if email_el:
             await email_el.click()
-            await email_el.type_text("")  # 清空旧值
+            await email_el.type_text("")
             await email_el.type_text(EMAIL, humanize=True)
         else:
             log.warning("未找到邮箱输入框")
@@ -299,7 +290,6 @@ async def login(browser, tab, max_retries=3):
 
         await human_delay()
 
-        # 填写密码
         pass_el = None
         for selector in [
             {"tag_name": "input", "name": "password"},
@@ -313,7 +303,7 @@ async def login(browser, tab, max_retries=3):
                 continue
         if pass_el:
             await pass_el.click()
-            await pass_el.type_text("")  # 清空旧值
+            await pass_el.type_text("")
             await pass_el.type_text(PASSWORD, humanize=True)
         else:
             log.warning("未找到密码输入框")
@@ -324,7 +314,6 @@ async def login(browser, tab, max_retries=3):
             log.warning("未能获取验证码，刷新重试")
             continue
 
-        # 点击登录
         try:
             login_btn = await tab.find(css="button.btn.btn-primary", timeout=10)
         except:
@@ -341,7 +330,6 @@ async def login(browser, tab, max_retries=3):
         if "/clientarea" in url:
             log.info("✅ 登录成功")
             await take_screenshot(browser, tab, "02_login_success")
-            # 保存 Cookie（用 browser 的 CDP 连接）
             try:
                 conn = getattr(browser, '_connection', None) or getattr(browser, 'connection', None)
                 if conn:
@@ -367,9 +355,8 @@ async def login(browser, tab, max_retries=3):
     log.error("多次登录尝试均失败")
     return False
 
-# ---------- 签到（原封不动）----------
+# ---------- 签到 ----------
 async def sign(browser, tab):
-    """返回签到后的账户余额字符串，签到失败或已签到返回 None"""
     log.info("前往签到页...")
     try:
         async with tab.expect_and_bypass_cloudflare_captcha():
@@ -428,9 +415,8 @@ async def sign(browser, tab):
         return balance_match2.group(1)
     return None
 
-# ---------- 续费（原封不动）----------
+# ---------- 续费 ----------
 async def renew(browser, tab):
-    """返回 (expiry_str, remain_days, renewed)"""
     log.info("检查续费...")
     try:
         async with tab.expect_and_bypass_cloudflare_captcha():
