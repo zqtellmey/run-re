@@ -19,10 +19,10 @@ jobs:
         with:
           python-version: '3.12'   # 用 3.12 更稳定
 
-      - name: 安装系统依赖 (Chromium + ffmpeg + xvfb)
+      - name: 安装系统依赖 (Chromium + ffmpeg + xvfb + 中文字体)
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq chromium-browser xvfb ffmpeg curl unzip
+          sudo apt-get install -y -qq chromium-browser xvfb ffmpeg curl unzip fonts-noto-cjk
 
       - name: 安装 Python 依赖
         run: pip install -r requirements.txt
