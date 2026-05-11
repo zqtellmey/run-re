@@ -1,8 +1,8 @@
-name: Freecloud 签到 (V2Ray 代理)
+name: Freecloud 签到 (pydoll + V2Ray)
 
 on:
   schedule:
-    - cron: '30 1 * * *'   # UTC 1:30 = 北京时间 9:30
+    - cron: '30 1 * * *'
   workflow_dispatch:
 
 jobs:
@@ -19,49 +19,51 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: 安装系统依赖 & Chrome
+      - name: 安装系统依赖
         run: |
           sudo apt-get update
-          wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | sudo apt-key add -
-          sudo sh -c 'echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google.list'
-          sudo apt-get update
-          sudo apt-get install -y google-chrome-stable xvfb
+          sudo apt-get install -y xvfb ffmpeg
 
       - name: 安装 Python 依赖
-        run: pip install selenium ddddocr webdriver-manager
+        run: pip install pydoll ddddocr Pillow
 
       - name: 下载并启动 Xray 代理
         env:
           V2RAY_CONFIG: ${{ secrets.V2RAY_CONFIG }}
         run: |
-          # 下载 Xray-core
           curl -sL https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip -o xray.zip
           unzip xray.zip && chmod +x xray
-          
-          # 写入代理配置
           echo "$V2RAY_CONFIG" > config.json
-          
-          # 启动 Xray
           ./xray run -c config.json &
           sleep 3
-          
-          # 测试代理连通性（可选）
           echo "直连 IP："
           curl -s ifconfig.me
           echo "代理 IP："
           curl -s --socks5 127.0.0.1:10808 ifconfig.me
 
-      - name: 执行签到脚本
+      - name: 运行脚本 (带录屏)
         env:
           EMAIL: ${{ secrets.EMAIL }}
           PASSWORD: ${{ secrets.PASSWORD }}
         run: |
-          # 用 xvfb 提供虚拟显示（保证截图可用）
-          xvfb-run --auto-servernum --server-args='-screen 0 1920x1080x24' python sign_with_v2ray.py
+          export DISPLAY=:99
+          Xvfb :99 -screen 0 1280x720x24 &
+          sleep 1
+          # 启动录屏
+          ffmpeg -f x11grab -video_size 1280x720 -i :99 -codec:v libx264 -preset ultrafast -qp 0 output.mp4 &
+          FFMPEG_PID=$!
+          sleep 2
+          # 运行脚本
+          python sign_with_pydoll.py
+          # 停止录屏
+          kill $FFMPEG_PID
+          sleep 2
 
-      - name: 上传截图
+      - name: 上传截图和录屏
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: screenshots
-          path: screenshots/
+          name: results
+          path: |
+            screenshots/
+            output.mp4
