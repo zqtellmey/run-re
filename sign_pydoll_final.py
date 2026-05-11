@@ -18,6 +18,40 @@ SIGN_PAGE = f"{BASE_URL}/addons?_plugin=5&controller=index&action=index"
 SCREENSHOT_DIR = Path("./screenshots")
 SCREENSHOT_DIR.mkdir(exist_ok=True)
 
+# ---------- WxPusher 推送 ----------
+WXPUSHER_TOKEN = os.environ.get("WXPUSHER_TOKEN", "")
+WXPUSHER_UID   = os.environ.get("WXPUSHER_UID", "")
+
+def wxpush(content: str):
+    """发送 WxPusher 消息，失败只打日志不中断主流程"""
+    if not WXPUSHER_TOKEN or not WXPUSHER_UID:
+        log.warning("📨 WXPUSHER_TOKEN 或 WXPUSHER_UID 未配置，跳过推送")
+        return
+    import urllib.request
+    payload = json.dumps({
+        "appToken": WXPUSHER_TOKEN,
+        "content": content,
+        "contentType": 1,
+        "uids": [WXPUSHER_UID],
+    }).encode()
+    try:
+        req = urllib.request.Request(
+            "https://wxpusher.zjiecode.com/api/send/message",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            result = json.loads(resp.read())
+            if result.get("success"):
+                log.info("📨 WxPusher 推送成功")
+            else:
+                log.warning(f"📨 WxPusher 推送失败: {result}")
+    except Exception as e:
+        log.warning(f"📨 WxPusher 推送异常: {e}")
+
+
+
 ocr = ddddocr.DdddOcr(beta=True, show_ad=False)
 
 # ---------- CDP 截图 ----------
@@ -274,6 +308,7 @@ async def login(browser, tab, max_retries=3):
 
 # ---------- 签到 ----------
 async def sign(browser, tab):
+    """返回签到后的账户余额字符串，签到失败或已签到返回 None"""
     log.info("前往签到页...")
     try:
         async with tab.expect_and_bypass_cloudflare_captcha():
@@ -288,7 +323,7 @@ async def sign(browser, tab):
     except:
         log.info("可能已经签到过了")
         await take_screenshot(browser, tab, "02_sign_skip")
-        return
+        return None
 
     await asyncio.sleep(2)
     text = await get_text(tab)
@@ -325,8 +360,20 @@ async def sign(browser, tab):
     log.info("签到完成")
     await take_screenshot(browser, tab, "03_sign_complete")
 
+    # 尝试从页面提取余额，兼容多种格式：「余额：2.00 积分」「积分余额 2.00」
+    text_after = await get_text(tab)
+    balance_match = re.search(r'(?:余额|积分余额|账户余额)[：:\s]*([\d.]+)\s*积分', text_after)
+    if balance_match:
+        return balance_match.group(1)
+    # 备用：直接匹配「2.00 积分」
+    balance_match2 = re.search(r'([\d.]+)\s*积分', text_after)
+    if balance_match2:
+        return balance_match2.group(1)
+    return None
+
 # ---------- 续费 ----------
 async def renew(browser, tab):
+    """返回 (expiry_str, remain_days, renewed)"""
     log.info("检查续费...")
     try:
         async with tab.expect_and_bypass_cloudflare_captcha():
@@ -339,19 +386,20 @@ async def renew(browser, tab):
     match = re.search(r'(\d{4}-\d{2}-\d{2})', text)
     if not match:
         log.info("未找到到期日，跳过续费")
-        return
-    expiry = datetime.strptime(match.group(1), "%Y-%m-%d")
+        return None, None, False
+    expiry_str = match.group(1)
+    expiry = datetime.strptime(expiry_str, "%Y-%m-%d")
     remain = (expiry - datetime.now()).days
-    log.info(f"到期: {match.group(1)}，剩余 {remain} 天")
+    log.info(f"到期: {expiry_str}，剩余 {remain} 天")
     if remain > 1:
         log.info("暂不续费")
-        return
+        return expiry_str, remain, False
 
     try:
         renew_btn = await tab.find(tag_name="button", text="续费", timeout=10)
         await renew_btn.click()
     except:
-        return
+        return expiry_str, remain, False
     await asyncio.sleep(2)
     try:
         confirm = await tab.find(tag_name="button", text="立即续费", timeout=5)
@@ -372,19 +420,39 @@ async def renew(browser, tab):
         pass
     log.info("续费完成")
     await take_screenshot(browser, tab, "04_renew_complete")
+    return expiry_str, remain, True
 
 # ---------- 主流程 ----------
 async def main():
     browser, tab = await create_browser()
     try:
         if not await login(browser, tab):
+            wxpush("❌ Runfreecloud 登录失败，请检查账号密码或验证码")
             return
-        await sign(browser, tab)
-        await renew(browser, tab)
+
+        balance = await sign(browser, tab)
+        expiry_str, remain, renewed = await renew(browser, tab)
+
+        # 组装推送内容
+        lines = ["✅ 签到成功"]
+        if balance is not None:
+            lines.append(f"账户余额剩余 {balance} 积分")
+        if expiry_str:
+            lines.append(f"到期时间 {expiry_str}")
+            if renewed:
+                lines.append("已自动续期")
+            else:
+                # 计算提醒续期的日期（到期前1天）
+                from datetime import timedelta
+                renew_date = (datetime.strptime(expiry_str, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+                lines.append(f"不用续期 等到 {renew_date} 再续期")
+        wxpush("\n".join(lines))
+
     except Exception as e:
         log.error(f"任务失败: {e}")
         traceback.print_exc()
         await take_screenshot(browser, tab, "99_error")
+        wxpush(f"❌ Runfreecloud 任务异常: {e}")
     finally:
         await asyncio.sleep(5)
         await browser.__aexit__(None, None, None)
