@@ -1,0 +1,35 @@
+# .github/workflows/auto_task.yml
+# 放到仓库的 .github/workflows/ 目录下
+
+name: Runfreecloud 自动签到续期
+
+on:
+  schedule:
+    # UTC 01:30 = 北京时间 09:30，每天执行
+    - cron: '30 1 * * *'
+  # 手动触发，方便测试
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安装依赖
+        run: pip install requests ddddocr pillow PySocks
+
+      - name: 执行脚本
+        env:
+          RFC_EMAIL:    ${{ secrets.RFC_EMAIL }}
+          RFC_PASSWORD: ${{ secrets.RFC_PASSWORD }}
+          RFC_PUSHPLUS_TOKEN: ${{ secrets.RFC_PUSHPLUS_TOKEN }}
+        run: python runfreecloud_with_proxy.py
