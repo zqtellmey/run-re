@@ -1,11 +1,14 @@
-import asyncio, os, re, time, logging, random, base64, traceback, json
+import asyncio, os, re, time, logging, random, base64, traceback
 from pathlib import Path
 from datetime import datetime, timedelta
 from pydoll.browser.chromium import Chrome
 from pydoll.browser.options import ChromiumOptions
 import ddddocr
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
 log = logging.getLogger(__name__)
 
 EMAIL = os.environ["EMAIL"]
@@ -17,12 +20,10 @@ SIGN_PAGE = f"{BASE_URL}/addons?_plugin=5&controller=index&action=index"
 
 SCREENSHOT_DIR = Path("./screenshots")
 SCREENSHOT_DIR.mkdir(exist_ok=True)
-USER_DATA_DIR = Path("./browser_data")
-USER_DATA_DIR.mkdir(exist_ok=True)
 
 ocr = ddddocr.DdddOcr(show_ad=False)
 
-# ---------- CDP 截图辅助函数 ----------
+# ---------- CDP 截图 ----------
 async def take_screenshot(browser, tab, name):
     try:
         conn = getattr(browser, '_connection', None) or getattr(browser, 'connection', None)
@@ -37,43 +38,6 @@ async def take_screenshot(browser, tab, name):
             log.info(f"📸 截图: {path}")
     except Exception as e:
         log.warning(f"截图失败: {e}")
-
-async def element_screenshot(tab, element, path):
-    """通过 CDP 截取特定元素的截图"""
-    try:
-        # 获取元素在页面中的位置和尺寸
-        script = """
-            (function(el) {
-                const rect = el.getBoundingClientRect();
-                return {x: rect.left, y: rect.top, width: rect.width, height: rect.height, scale: window.devicePixelRatio};
-            })(arguments[0])
-        """
-        box = await tab.execute_script(script, element_id=element)
-        if not box:
-            return None
-        scale = box.get('scale', 1)
-        clip = {
-            "x": box['x'] * scale,
-            "y": box['y'] * scale,
-            "width": box['width'] * scale,
-            "height": box['height'] * scale,
-            "scale": 1
-        }
-        conn = getattr(tab, '_connection', None) or getattr(tab, 'connection', None)
-        if not conn:
-            return None
-        result = await conn.execute("Page.captureScreenshot", {
-            "format": "png",
-            "clip": clip,
-            "captureBeyondViewport": True
-        })
-        data = result.get("data", "")
-        if data:
-            Path(path).write_bytes(base64.b64decode(data))
-            return path
-    except Exception as e:
-        log.warning(f"元素截图失败: {e}")
-    return None
 
 async def get_text(tab):
     try:
@@ -96,7 +60,6 @@ async def create_browser():
     options.add_argument("--password-store=basic")
     options.add_argument("--use-mock-keychain")
     options.add_argument("--proxy-server=socks5://127.0.0.1:10808")
-    options.add_argument(f"--user-data-dir={USER_DATA_DIR.resolve()}")
     options.browser_preferences = {
         "credentials_enable_service": False,
         "profile": {"password_manager_enabled": False},
@@ -149,7 +112,7 @@ async def login(browser, tab):
 
     await take_screenshot(browser, tab, "01_login_page")
 
-    # 填写邮箱、密码
+    # 填写邮箱
     try:
         email_el = await tab.find(tag_name="input", name="email", timeout=10)
     except:
@@ -162,6 +125,7 @@ async def login(browser, tab):
     await email_el.type_text(EMAIL, humanize=True)
     await human_delay()
 
+    # 填写密码
     try:
         pass_el = await tab.find(tag_name="input", name="password", timeout=5)
     except:
@@ -171,21 +135,26 @@ async def login(browser, tab):
     await pass_el.click()
     await pass_el.type_text(PASSWORD, humanize=True)
 
-    # 验证码（使用元素截图 + 数字过滤）
+    # 验证码：基于你本地的 base64 图片提取逻辑
     for _ in range(3):
         try:
             cap_img = await tab.find(id="allow_login_email_captcha", timeout=5)
         except:
-            cap_img = await tab.find(tag_name="img", alt="验证码", timeout=5)
+            cap_img = None
+        if not cap_img:
+            try:
+                cap_img = await tab.find(tag_name="img", alt="验证码", timeout=5)
+            except:
+                cap_img = None
         if cap_img:
-            # 使用自定义元素截图
-            path = "/tmp/captcha.png"
-            if await element_screenshot(tab, cap_img, path):
-                with open(path, "rb") as f:
-                    raw = ocr.classification(f.read())
+            src = await cap_img.get_attribute("src")
+            if src and src.startswith("data:image"):
+                b64 = src.split(",", 1)[1]
+                img_bytes = base64.b64decode(b64)
+                raw = ocr.classification(img_bytes)
                 code = re.sub(r'[^0-9]', '', raw)   # 只保留数字
                 log.info(f"验证码识别: {raw} -> {code}")
-                cap_input = await tab.find(placeholder="请输入验证码", timeout=5)
+                cap_input = await tab.find(tag_name="input", name="captcha", timeout=5)
                 await cap_input.click()
                 await cap_input.type_text(code, humanize=True)
                 break
@@ -193,11 +162,9 @@ async def login(browser, tab):
 
     # 点击登录
     try:
-        login_btn = await tab.find(id="login-btn", timeout=5)
+        login_btn = await tab.find(css="button.btn.btn-primary", timeout=10)
     except:
         login_btn = await tab.find(tag_name="button", text="登录", timeout=10)
-    if not login_btn:
-        login_btn = await tab.find(css="button.btn.btn-primary", timeout=5)
     await login_btn.click()
     await asyncio.sleep(5)
 
@@ -316,7 +283,7 @@ async def main():
         traceback.print_exc()
         await take_screenshot(browser, tab, "99_error")
     finally:
-        # 停留几秒，让录屏捕捉到最后状态
+        # 延长 5 秒再退出，等录屏捕捉完整画面
         await asyncio.sleep(5)
         await browser.__aexit__(None, None, None)
         log.info("任务结束")
