@@ -1,4 +1,5 @@
-playwright>=1.40
+selenium
+webdriver-manager
 ddddocr
 Pillow
 requests
