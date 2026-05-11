@@ -1,10 +1,10 @@
 import asyncio
 import os
 import re
+import time
 import logging
 import random
 import base64
-import json
 import traceback
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -25,18 +25,18 @@ BASE_URL = "https://run.freecloud.ltd"
 LOGIN_URL = f"{BASE_URL}/login"
 USER_CENTER = f"{BASE_URL}/clientarea"
 SIGN_PAGE = f"{BASE_URL}/addons?_plugin=5&controller=index&action=index"
-HEADLESS = os.getenv("HEADLESS", "false").lower() == "true"
 
 SCREENSHOT_DIR = Path("./screenshots")
 SCREENSHOT_DIR.mkdir(exist_ok=True)
+# 持久化浏览器数据目录
+USER_DATA_DIR = Path("./browser_data")
+USER_DATA_DIR.mkdir(exist_ok=True)
+
 ocr = ddddocr.DdddOcr(show_ad=False)
 
-# ---------- 工具函数（借鉴 katabump）----------
-async def human_delay(min_s=0.3, max_s=1.0):
-    await asyncio.sleep(min_s + random.random() * (max_s - min_s))
-
+# ---------- 截图 ----------
 async def take_screenshot(browser, tab, name):
-    """通过 CDP 截图，兼容 pydoll"""
+    """通过 CDP 截图"""
     try:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         path = SCREENSHOT_DIR / f"{ts}_{name}.png"
@@ -48,6 +48,7 @@ async def take_screenshot(browser, tab, name):
                 Path(path).write_bytes(base64.b64decode(data))
                 log.info(f"📸 截图: {path}")
                 return
+        # 回退
         await tab.screenshot(str(path))
     except Exception as e:
         log.warning(f"截图失败: {e}")
@@ -58,52 +59,50 @@ async def get_text(tab):
     except:
         return ""
 
-# ---------- 浏览器启动（借鉴 katabump 的参数）----------
+async def human_delay(min_s=0.3, max_s=0.8):
+    await asyncio.sleep(min_s + random.random() * (max_s - min_s))
+
+# ---------- 浏览器启动 ----------
 async def create_browser():
     options = ChromiumOptions()
-    options.headless = HEADLESS
+    options.headless = False          # 靠着 xvfb 运行
     options.add_argument("--window-size=1280,720")
+    options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_argument("--disable-gpu")
-    options.add_argument("--disable-features=VizDisplayCompositor")
+    options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_argument("--password-store=basic")
     options.add_argument("--use-mock-keychain")
     options.add_argument("--proxy-server=socks5://127.0.0.1:10808")
+    # 持久化 browser data
+    options.add_argument(f"--user-data-dir={USER_DATA_DIR.resolve()}")
     options.browser_preferences = {
         "credentials_enable_service": False,
-        "profile": {
-            "password_manager_enabled": False,
-            "default_content_setting_values": {"notifications": 2, "geolocation": 2},
-        },
+        "profile": {"password_manager_enabled": False},
     }
     browser = await Chrome(options=options).__aenter__()
     tab = await browser.start()
     return browser, tab
 
-# ---------- Cloudflare 验证处理（借鉴 katabump 的 JS 操作）----------
-async def wait_for_cloudflare(tab, timeout=15):
-    """等待 Cloudflare 验证完成，使用 katabump 中的 JS 方法操作 shadow DOM"""
-    log.info("检测到 Cloudflare 验证，尝试自动完成...")
-    await asyncio.sleep(2)
-    for i in range(timeout):
+# ---------- Cloudflare 手动点击（备份）----------
+async def manual_cf_click(tab, timeout=15):
+    log.info("尝试手动完成 Cloudflare 验证...")
+    for _ in range(timeout):
         body = await get_text(tab)
-        if "email" in body.lower() or "登录" in body:
-            log.info("Cloudflare 验证已完成")
+        if "email" in body or "登录" in body:
+            log.info("验证已完成")
             return True
-        # 尝试点击验证框（katabump 式 JS 操作）
         await tab.execute_script("""
             (function() {
                 const checkboxes = document.querySelectorAll('iframe');
                 for (let iframe of checkboxes) {
                     try {
-                        const innerDoc = iframe.contentDocument || iframe.contentWindow.document;
-                        const checkbox = innerDoc.querySelector('#checkbox, input[type="checkbox"]');
-                        if (checkbox) {
-                            checkbox.focus();
-                            checkbox.click();
-                            checkbox.dispatchEvent(new MouseEvent('click', {bubbles: true}));
-                            checkbox.dispatchEvent(new Event('change', {bubbles: true}));
+                        const doc = iframe.contentDocument || iframe.contentWindow.document;
+                        const cb = doc.querySelector('#checkbox, input[type="checkbox"]');
+                        if (cb) {
+                            cb.click();
+                            cb.dispatchEvent(new MouseEvent('click', {bubbles: true}));
+                            cb.dispatchEvent(new Event('change', {bubbles: true}));
                         }
                     } catch(e) {}
                 }
@@ -112,10 +111,9 @@ async def wait_for_cloudflare(tab, timeout=15):
         await asyncio.sleep(1)
     return False
 
-# ---------- 登录（使用 katabump 的 bypass 上下文）----------
+# ---------- 登录 ----------
 async def login(browser, tab):
     log.info("访问登录页...")
-    # ★ 核心：使用 katabump 相同的 Cloudflare 绕过方式
     try:
         async with tab.expect_and_bypass_cloudflare_captcha():
             await tab.go_to(LOGIN_URL)
@@ -123,54 +121,64 @@ async def login(browser, tab):
         await tab.go_to(LOGIN_URL)
 
     await asyncio.sleep(3)
-
-    # 如果仍然有验证页面，手动处理
     body = await get_text(tab)
     if "verify you are human" in body.lower() or "performing security verification" in body.lower():
-        if not await wait_for_cloudflare(tab):
-            log.warning("Cloudflare 验证可能未完成，继续尝试登录...")
+        if not await manual_cf_click(tab):
+            log.warning("Cloudflare 验证可能未完成")
 
     await take_screenshot(browser, tab, "01_login_page")
 
-    # 填写邮箱密码（使用 katabump 的混合方式：先尝试 find，失败则 JS 注入）
+    # 填写邮箱密码 （采用你本地脚本的查找顺序）
     try:
         email_el = await tab.find(tag_name="input", name="email", timeout=10)
-        await email_el.click()
-        await email_el.type_text(EMAIL, humanize=True)
-        await human_delay()
-        pass_el = await tab.find(tag_name="input", name="password")
-        await pass_el.click()
-        await pass_el.type_text(PASSWORD, humanize=True)
-    except Exception:
-        await tab.execute_script(f"""
-            document.querySelector('input[name="email"]').value='{EMAIL}';
-            document.querySelector('input[name="password"]').value='{PASSWORD}';
-        """)
-        await human_delay()
+    except:
+        email_el = None
+    if not email_el:
+        email_el = await tab.find(tag_name="input", placeholder="请输入邮箱地址", timeout=5)
+    if not email_el:
+        email_el = await tab.find(tag_name="input", placeholder="请输入您的邮箱", timeout=5)
+    await email_el.click()
+    await email_el.type_text(EMAIL, humanize=True)
+    await human_delay()
 
-    # 识别验证码
+    try:
+        pass_el = await tab.find(tag_name="input", name="password", timeout=5)
+    except:
+        pass_el = await tab.find(tag_name="input", placeholder="请输入登录密码", timeout=5)
+    if not pass_el:
+        pass_el = await tab.find(tag_name="input", placeholder="请输入您的密码", timeout=5)
+    await pass_el.click()
+    await pass_el.type_text(PASSWORD, humanize=True)
+
+    # 验证码：采用你本地的纯数字提取逻辑
     for _ in range(3):
         try:
-            img = await tab.find(tag_name="img")
-            src = await img.get_attribute("src")
-            if src and src.startswith("data:image"):
-                b64 = src.split(",", 1)[1]
-                img_bytes = base64.b64decode(b64)
-                captcha = ocr.classification(img_bytes)
-                captcha = re.sub(r'[^a-zA-Z0-9]', '', captcha)
-                log.info(f"验证码: {captcha}")
-                captcha_el = await tab.find(tag_name="input", name="captcha", timeout=5)
-                await captcha_el.click()
-                await captcha_el.type_text(captcha, humanize=True)
-                break
-        except Exception as e:
-            log.warning(f"验证码重试: {e}")
-            await asyncio.sleep(1)
+            cap_img = await tab.find(id="allow_login_email_captcha", timeout=5)
+        except:
+            cap_img = await tab.find(tag_name="img", alt="验证码", timeout=5)
+        if cap_img:
+            # 截图验证码然后 OCR
+            cap_img.screenshot("/tmp/captcha.png")
+            with open("/tmp/captcha.png", "rb") as f:
+                img_bytes = f.read()
+            raw = ocr.classification(img_bytes)
+            code = re.sub(r'[^0-9]', '', raw)   # 只保留数字
+            log.info(f"验证码识别: {raw} -> {code}")
+            cap_input = await tab.find(tag_name="input", placeholder="请输入验证码", timeout=5)
+            await cap_input.click()
+            await cap_input.type_text(code, humanize=True)
+            break
+        await asyncio.sleep(1)
 
-    # 点击登录按钮
-    btn = await tab.find(tag_name="button", text="登录", timeout=10)
-    await btn.click()
-    await asyncio.sleep(4)
+    # 点击登录
+    try:
+        login_btn = await tab.find(tag_name="button", id="login-btn", timeout=5)
+    except:
+        login_btn = await tab.find(css="button.btn.btn-primary", timeout=5)
+    if not login_btn:
+        login_btn = await tab.find(tag_name="button", text="登录", timeout=10)
+    await login_btn.click()
+    await asyncio.sleep(5)
 
     url = await tab.execute_script("return window.location.href")
     if "/clientarea" in url:
@@ -182,7 +190,7 @@ async def login(browser, tab):
 
 # ---------- 签到 ----------
 async def sign(browser, tab):
-    log.info("开始签到...")
+    log.info("前往签到页...")
     try:
         async with tab.expect_and_bypass_cloudflare_captcha():
             await tab.go_to(SIGN_PAGE)
@@ -199,27 +207,32 @@ async def sign(browser, tab):
         return
 
     # 数学弹窗
-    try:
-        text = await get_text(tab)
-        match = re.search(r'请计算[：:]\s*(\d+)\s*([+\-*/])\s*(\d+)', text)
-        if match:
-            a, op, b = int(match[1]), match[2], int(match[3])
-            result = a + b if op == '+' else a - b if op == '-' else a * b if op == '*' else a // b
-            ans = str(result)
-            ans_el = await tab.find(tag_name="input", placeholder="请输入答案", timeout=5)
-            await ans_el.click()
-            await ans_el.type_text(ans, humanize=True)
-            verify_btn = await tab.find(tag_name="button", text="验证答案", timeout=5)
-            await verify_btn.click()
-            await asyncio.sleep(2)
-    except Exception as e:
-        log.warning(f"数学弹窗异常: {e}")
+    await asyncio.sleep(2)
+    text = await get_text(tab)
+    match = re.search(r'请计算[：:]\s*(\d+)\s*([+\-*/])\s*(\d+)', text)
+    if match:
+        a, op, b = int(match[1]), match[2], int(match[3])
+        if op == '+': result = a + b
+        elif op == '-': result = a - b
+        elif op == '*': result = a * b
+        elif op == '/': result = a / b if b != 0 else 0
+        else: result = 0
+        result_str = str(int(result)) if result == int(result) else f"{result:.2f}"
+        ans_el = await tab.find(tag_name="input", placeholder="请输入答案", timeout=5)
+        await ans_el.click()
+        await ans_el.type_text(result_str, humanize=True)
+        ver_btn = await tab.find(tag_name="button", text="验证答案", timeout=5)
+        await ver_btn.click()
+        await asyncio.sleep(2)
 
-    try:
-        ok = await tab.find(tag_name="button", text="确定", timeout=3)
-        await ok.click()
-    except:
-        pass
+    # 关闭可能出现的提示框
+    for _ in range(2):
+        try:
+            ok = await tab.find(tag_name="button", text="确定", timeout=3)
+            await ok.click()
+            await asyncio.sleep(1)
+        except:
+            break
     log.info("签到完成")
     await take_screenshot(browser, tab, "03_sign_complete")
 
@@ -246,23 +259,26 @@ async def renew(browser, tab):
         return
 
     try:
-        await (await tab.find(tag_name="button", text="续费", timeout=10)).click()
+        renew_btn = await tab.find(tag_name="button", text="续费", timeout=10)
+        await renew_btn.click()
     except:
         return
     await asyncio.sleep(2)
     try:
-        await (await tab.find(tag_name="button", text="立即续费", timeout=5)).click()
+        confirm = await tab.find(tag_name="button", text="立即续费", timeout=5)
+        await confirm.click()
     except:
         pass
     await asyncio.sleep(2)
     try:
-        await (await tab.find(tag_name="button", text="立即支付", timeout=5)).click()
+        pay = await tab.find(tag_name="button", text="立即支付", timeout=5)
+        await pay.click()
     except:
         pass
     await asyncio.sleep(2)
     try:
-        ok_btn = await tab.find(tag_name="button", text="确定", timeout=3)
-        await ok_btn.click()
+        ok = await tab.find(tag_name="button", text="确定", timeout=3)
+        await ok.click()
     except:
         pass
     log.info("续费完成")
