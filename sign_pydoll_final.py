@@ -1,4 +1,4 @@
-import asyncio, os, re, time, logging, random, base64, traceback
+import asyncio, os, re, time, logging, random, base64, traceback, signal, subprocess
 from pathlib import Path
 from datetime import datetime, timedelta
 from pydoll.browser.chromium import Chrome
@@ -18,7 +18,6 @@ SIGN_PAGE = f"{BASE_URL}/addons?_plugin=5&controller=index&action=index"
 SCREENSHOT_DIR = Path("./screenshots")
 SCREENSHOT_DIR.mkdir(exist_ok=True)
 
-# 启用 beta 模式，提高数字识别率
 ocr = ddddocr.DdddOcr(beta=True, show_ad=False)
 
 # ---------- CDP 截图 ----------
@@ -46,24 +45,49 @@ async def get_text(tab):
 async def human_delay(min_s=0.3, max_s=0.8):
     await asyncio.sleep(random.uniform(min_s, max_s))
 
-# ---------- 浏览器启动 ----------
-async def create_browser():
-    options = ChromiumOptions()
-    options.headless = False
-    options.add_argument("--window-size=1280,720")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--password-store=basic")
-    options.add_argument("--use-mock-keychain")
-    options.add_argument("--proxy-server=socks5://127.0.0.1:10808")
-    options.browser_preferences = {
-        "credentials_enable_service": False,
-        "profile": {"password_manager_enabled": False},
-    }
-    browser = await Chrome(options=options).__aenter__()
-    tab = await browser.start()
-    return browser, tab
+# ---------- 清理残留进程 ----------
+def kill_chrome():
+    try:
+        subprocess.run(["pkill", "-f", "chrome"], check=False)
+        subprocess.run(["pkill", "-f", "chromium"], check=False)
+        time.sleep(2)
+    except:
+        pass
+
+# ---------- 浏览器启动 (带重试) ----------
+async def create_browser(max_retries=2):
+    # 清理残留
+    kill_chrome()
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            options = ChromiumOptions()
+            options.headless = False
+            options.binary_location = "/usr/bin/google-chrome"  # 明确指定 Chrome 路径
+            options.add_argument("--window-size=1280,720")
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-dev-shm-usage")
+            options.add_argument("--disable-gpu")
+            options.add_argument("--password-store=basic")
+            options.add_argument("--use-mock-keychain")
+            options.add_argument("--proxy-server=socks5://127.0.0.1:10808")
+            options.add_argument("--remote-debugging-port=0")  # 自动分配端口，避免固定端口冲突
+
+            options.browser_preferences = {
+                "credentials_enable_service": False,
+                "profile": {"password_manager_enabled": False},
+            }
+
+            browser = await Chrome(options=options).__aenter__()
+            tab = await browser.start()
+            log.info(f"浏览器启动成功 (尝试 {attempt})")
+            return browser, tab
+        except Exception as e:
+            log.error(f"浏览器启动失败 (尝试 {attempt}/{max_retries}): {e}")
+            kill_chrome()
+            await asyncio.sleep(3)
+
+    raise RuntimeError("浏览器多次启动失败")
 
 # ---------- Cloudflare 手动点击 ----------
 async def manual_cf_click(tab, timeout=15):
@@ -94,7 +118,6 @@ async def manual_cf_click(tab, timeout=15):
 
 # ---------- 获取并填入验证码 ----------
 async def fill_captcha(tab):
-    """返回验证码字符串，失败返回空"""
     for _ in range(3):
         try:
             cap_img = await tab.find(id="allow_login_email_captcha", timeout=5)
@@ -113,7 +136,6 @@ async def fill_captcha(tab):
                 raw = ocr.classification(img_bytes)
                 code = re.sub(r'[^0-9]', '', raw)
                 log.info(f"验证码识别: {raw} -> {code}")
-                # JS 注入验证码
                 await tab.execute_script(f"""
                     (function() {{
                         var input = document.querySelector('#captcha_allow_login_email_captcha') ||
@@ -131,7 +153,7 @@ async def fill_captcha(tab):
         await asyncio.sleep(1)
     return ""
 
-# ---------- 登录（支持重试）----------
+# ---------- 登录 (带重试) ----------
 async def login(browser, tab, max_retries=3):
     for attempt in range(1, max_retries + 1):
         log.info(f"登录尝试 {attempt}/{max_retries}")
@@ -147,7 +169,7 @@ async def login(browser, tab, max_retries=3):
             if not await manual_cf_click(tab):
                 log.warning("Cloudflare 验证可能未完成")
 
-        # 处理邮箱输入框：确保为空再填入
+        # 处理邮箱输入框
         email_el = None
         for selector in [
             {"tag_name": "input", "name": "email"},
@@ -161,8 +183,7 @@ async def login(browser, tab, max_retries=3):
                 continue
         if email_el:
             await email_el.click()
-            # 清空已有内容（清除旧账号）
-            await email_el.type_text("", humanize=False)
+            await email_el.clear_value() if hasattr(email_el, 'clear_value') else await email_el.type_text("")
             await email_el.type_text(EMAIL, humanize=True)
         else:
             log.warning("未找到邮箱输入框")
@@ -184,20 +205,18 @@ async def login(browser, tab, max_retries=3):
                 continue
         if pass_el:
             await pass_el.click()
-            # 清空已有内容
-            await pass_el.type_text("", humanize=False)
+            await pass_el.clear_value() if hasattr(pass_el, 'clear_value') else await pass_el.type_text("")
             await pass_el.type_text(PASSWORD, humanize=True)
         else:
             log.warning("未找到密码输入框")
             continue
 
-        # 获取验证码并填入
         captcha_code = await fill_captcha(tab)
         if not captcha_code:
             log.warning("未能获取验证码，刷新重试")
             continue
 
-        # 点击登录按钮
+        # 点击登录
         try:
             login_btn = await tab.find(css="button.btn.btn-primary", timeout=10)
         except:
@@ -212,7 +231,6 @@ async def login(browser, tab, max_retries=3):
             return True
 
         log.warning(f"登录失败，当前 URL: {url}")
-        # 刷新页面，准备下一次重试
         await asyncio.sleep(1)
 
     log.error("多次登录尝试均失败")
@@ -316,7 +334,7 @@ async def renew(browser, tab):
 async def main():
     browser, tab = await create_browser()
     try:
-        if not await login(browser, tab, max_retries=3):
+        if not await login(browser, tab):
             log.error("登录失败，终止任务")
             return
         await sign(browser, tab)
