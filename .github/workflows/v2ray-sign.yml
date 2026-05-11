@@ -59,7 +59,7 @@ jobs:
           RECORD_PID=$!
           sleep 1
           # 运行签到脚本（超时防止卡死）
-          timeout 280 python sign_pydoll_final.py || echo "脚本退出码: $?"
+          timeout 285 python sign_pydoll_final.py || echo "脚本退出码: $?"
           kill $RECORD_PID 2>/dev/null || true
           wait $RECORD_PID 2>/dev/null || true
           pkill Xvfb 2>/dev/null || true
