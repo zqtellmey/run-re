@@ -1,4 +1,3 @@
-selenium
+playwright
 ddddocr
-requests
 Pillow
