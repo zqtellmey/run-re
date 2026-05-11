@@ -1,0 +1,64 @@
+name: Freecloud 签到续期 (Obscura)
+
+on:
+  schedule:
+    # 每天 UTC 1:30 执行（北京时间 09:30）
+    - cron: '30 1 * * *'
+  workflow_dispatch:   # 手动触发按钮
+
+jobs:
+  sign:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安装 Python 依赖
+        run: pip install -r requirements.txt
+
+      - name: 下载并解压 Obsura
+        run: |
+          curl -sL -o obscura.tar.gz https://github.com/h4ckf0r0day/obscura/releases/latest/download/obscura-x86_64-linux.tar.gz
+          tar xzf obscura.tar.gz
+          chmod +x obscura
+          echo "✅ Obsura 已就绪"
+
+      - name: 启动 Obsura 并执行签到
+        env:
+          EMAIL: ${{ secrets.EMAIL }}
+          PASSWORD: ${{ secrets.PASSWORD }}
+        run: |
+          # 启动 Obsura 服务，开启隐身模式，监听 9222 端口
+          ./obscura serve --port 9222 --stealth &
+          OBS_PID=$!
+          echo "Obsura PID: $OBS_PID"
+          
+          # 等待 Obsura 完全启动（通过检查端口是否打开）
+          for i in {1..10}; do
+            if ss -tlnp | grep -q 9222; then
+              echo "✅ Obsura 已启动"
+              break
+            fi
+            echo "等待 Obsura 启动... ($i/10)"
+            sleep 1
+          done
+          
+          # 运行签到脚本
+          python sign_with_obscura.py
+          
+          # 脚本结束后，关闭 Obsura
+          kill $OBS_PID 2>/dev/null || true
+
+      - name: 上传截图
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots
+          path: screenshots/
