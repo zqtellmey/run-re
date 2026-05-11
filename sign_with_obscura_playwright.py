@@ -3,7 +3,7 @@ import re
 import time
 import logging
 from datetime import datetime, timedelta
-from playwright.sync_api import sync_playwright, connect_over_cdp
+from playwright.sync_api import sync_playwright
 import ddddocr
 
 logging.basicConfig(
@@ -166,20 +166,22 @@ def renew_product(page):
 
 def main():
     logging.info("===== 开始自动签到(Obscura + Playwright) =====")
-    # 连接到 Obscura 的 CDP 端点
-    browser = connect_over_cdp("http://127.0.0.1:9222")
-    context = browser.contexts[0] if browser.contexts else browser.new_context()
-    page = context.pages[0] if context.pages else context.new_page()
-    
-    try:
-        login(page)
-        sign(page)
-        renew_product(page)
-    except Exception as e:
-        logging.error(f"任务执行失败: {e}")
-        save_screenshot(page, "99_error")
-    finally:
-        browser.close()
+    # 通过 playwright 连接到已启动的 Obscura CDP 服务
+    with sync_playwright() as p:
+        browser = p.chromium.connect_over_cdp("http://127.0.0.1:9222")
+        # 获取默认的上下文和页面（Obscura 已自动创建）
+        context = browser.contexts[0] if browser.contexts else browser.new_context()
+        page = context.pages[0] if context.pages else context.new_page()
+        
+        try:
+            login(page)
+            sign(page)
+            renew_product(page)
+        except Exception as e:
+            logging.error(f"任务执行失败: {e}")
+            save_screenshot(page, "99_error")
+        finally:
+            browser.close()
     logging.info("===== 任务结束 =====")
 
 if __name__ == "__main__":
