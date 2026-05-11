@@ -1,4 +1,4 @@
-import asyncio, os, re, time, logging, random, base64, traceback, json
+import asyncio, os, re, time, logging, random, base64, traceback, json, math
 from pathlib import Path
 from datetime import datetime, timedelta
 from pydoll.browser.chromium import Chrome
@@ -15,7 +15,6 @@ LOGIN_URL = f"{BASE_URL}/login"
 USER_CENTER = f"{BASE_URL}/clientarea"
 SIGN_PAGE = f"{BASE_URL}/addons?_plugin=5&controller=index&action=index"
 
-# 截图目录
 SCREENSHOT_DIR = Path("./screenshots")
 SCREENSHOT_DIR.mkdir(exist_ok=True)
 
@@ -68,13 +67,18 @@ def wxpush(content: str):
 
 ocr = ddddocr.DdddOcr(beta=True, show_ad=False)
 
-# ---------- 截图（改用 pydoll 自带方法）----------
+# ---------- 截图（使用 CDP 命令，无需 browser 连接）----------
 async def take_screenshot(browser, tab, name):
     try:
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = SCREENSHOT_DIR / f"{ts}_{name}.png"
-        await tab.screenshot(str(path))
-        log.info(f"📸 截图: {path}")
+        result = await tab.execute("Page.captureScreenshot", {"format": "png"})
+        data = result.get("data", "")
+        if data:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            path = SCREENSHOT_DIR / f"{ts}_{name}.png"
+            Path(path).write_bytes(base64.b64decode(data))
+            log.info(f"📸 截图: {path}")
+        else:
+            log.warning("截图返回空数据")
     except Exception as e:
         log.warning(f"截图失败: {e}")
 
@@ -331,20 +335,17 @@ async def login(browser, tab, max_retries=3):
             log.info("✅ 登录成功")
             await take_screenshot(browser, tab, "02_login_success")
             try:
-                conn = getattr(browser, '_connection', None) or getattr(browser, 'connection', None)
-                if conn:
-                    result = await conn.execute("Network.getCookies", {"urls": [BASE_URL, LOGIN_URL, USER_CENTER]})
-                    cookie_list = [{
-                        "name": c["name"],
-                        "value": c["value"],
-                        "domain": c.get("domain", ""),
-                        "path": c.get("path", ""),
-                        "secure": c.get("secure", False),
-                    } for c in result.get("cookies", [])]
+                result = await tab.execute("Network.getCookies", {"urls": [BASE_URL, LOGIN_URL, USER_CENTER]})
+                cookie_list = [{
+                    "name": c["name"],
+                    "value": c["value"],
+                    "domain": c.get("domain", ""),
+                    "path": c.get("path", ""),
+                    "secure": c.get("secure", False),
+                } for c in result.get("cookies", [])]
+                if cookie_list:
                     save_cookies(cookie_list)
                     log.info(f"已保存 {len(cookie_list)} 个 Cookie")
-                else:
-                    log.warning("无法获取 browser CDP 连接，跳过保存 Cookie")
             except Exception as e:
                 log.warning(f"保存 Cookie 失败: {e}")
             return True
@@ -383,7 +384,6 @@ async def sign(browser, tab):
         elif op == '*': result = a * b
         elif op == '/': result = a / b if b != 0 else 0
         else: result = 0
-        import math
         if result == int(result):
             result_str = str(int(result))
         else:
