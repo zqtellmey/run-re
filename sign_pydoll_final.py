@@ -360,13 +360,15 @@ async def sign(browser, tab):
     log.info("签到完成")
     await take_screenshot(browser, tab, "03_sign_complete")
 
-    # 尝试从页面提取余额，兼容多种格式：「余额：2.00 积分」「积分余额 2.00」
+    # 从页面提取账户余额
+    # 页面结构：「账户余额剩余 2.00 积分」，前面还有「每日签到赠送 0.5 积分」
+    # 必须精确匹配「账户余额剩余」，避免误抓签到奖励的 0.5
     text_after = await get_text(tab)
-    balance_match = re.search(r'(?:余额|积分余额|账户余额)[：:\s]*([\d.]+)\s*积分', text_after)
+    balance_match = re.search(r'账户余额剩余\s*([\d.]+)\s*积分', text_after)
     if balance_match:
         return balance_match.group(1)
-    # 备用：直接匹配「2.00 积分」
-    balance_match2 = re.search(r'([\d.]+)\s*积分', text_after)
+    # 备用：匹配其他格式「余额：2.00 积分」「积分余额 2.00 积分」
+    balance_match2 = re.search(r'(?:积分余额|账户余额)[：:\s]+([\d.]+)\s*积分', text_after)
     if balance_match2:
         return balance_match2.group(1)
     return None
@@ -383,23 +385,37 @@ async def renew(browser, tab):
     await asyncio.sleep(3)
 
     text = await get_text(tab)
+
+    # clientarea 页面余额兜底提取
+    # HTML: <h1>" 2.00 "<small>积分</small></h1>，innerText 可能是「2.00\n积分」
+    # 同时兼容「账户余额剩余 2.00 积分」格式
+    clientarea_balance = None
+    bal_m = re.search(r'账户余额剩余\s*([\d.]+)\s*积分', text)
+    if bal_m:
+        clientarea_balance = bal_m.group(1)
+    else:
+        # 匹配「可用余额」附近的数字：「2.00\n积分」或「2.00 积分」后跟「积分」
+        bal_m2 = re.search(r'([\d.]+)\s*\n?\s*积分[\s\S]{0,30}?可用余额|可用余额[\s\S]{0,30}?([\d.]+)\s*\n?\s*积分', text)
+        if bal_m2:
+            clientarea_balance = bal_m2.group(1) or bal_m2.group(2)
+
     match = re.search(r'(\d{4}-\d{2}-\d{2})', text)
     if not match:
         log.info("未找到到期日，跳过续费")
-        return None, None, False
+        return None, None, False, clientarea_balance
     expiry_str = match.group(1)
     expiry = datetime.strptime(expiry_str, "%Y-%m-%d")
     remain = (expiry - datetime.now()).days
     log.info(f"到期: {expiry_str}，剩余 {remain} 天")
     if remain > 1:
         log.info("暂不续费")
-        return expiry_str, remain, False
+        return expiry_str, remain, False, clientarea_balance
 
     try:
         renew_btn = await tab.find(tag_name="button", text="续费", timeout=10)
         await renew_btn.click()
     except:
-        return expiry_str, remain, False
+        return expiry_str, remain, False, clientarea_balance
     await asyncio.sleep(2)
     try:
         confirm = await tab.find(tag_name="button", text="立即续费", timeout=5)
@@ -420,7 +436,7 @@ async def renew(browser, tab):
         pass
     log.info("续费完成")
     await take_screenshot(browser, tab, "04_renew_complete")
-    return expiry_str, remain, True
+    return expiry_str, remain, True, clientarea_balance
 
 # ---------- 主流程 ----------
 async def main():
@@ -431,12 +447,15 @@ async def main():
             return
 
         balance = await sign(browser, tab)
-        expiry_str, remain, renewed = await renew(browser, tab)
+        expiry_str, remain, renewed, clientarea_balance = await renew(browser, tab)
+
+        # 签到页余额优先，clientarea 兜底
+        final_balance = balance if balance is not None else clientarea_balance
 
         # 组装推送内容
         lines = ["✅ 签到成功"]
-        if balance is not None:
-            lines.append(f"账户余额剩余 {balance} 积分")
+        if final_balance is not None:
+            lines.append(f"账户余额剩余 {final_balance} 积分")
         if expiry_str:
             lines.append(f"到期时间 {expiry_str}")
             if renewed:
