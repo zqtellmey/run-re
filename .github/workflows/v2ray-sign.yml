@@ -99,6 +99,6 @@ jobs:
         with:
           name: debug-files
           path: |
-            ./screenshots/
+            ./screenshots/*.png
             /tmp/recording.mp4
           retention-days: 3
