@@ -5,10 +5,7 @@ from pydoll.browser.chromium import Chrome
 from pydoll.browser.options import ChromiumOptions
 import ddddocr
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
 EMAIL = os.environ["EMAIL"]
@@ -56,7 +53,6 @@ async def create_browser():
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
-    # ❗️ 删除 --disable-blink-features=AutomationControlled，避免影响页面渲染
     options.add_argument("--password-store=basic")
     options.add_argument("--use-mock-keychain")
     options.add_argument("--proxy-server=socks5://127.0.0.1:10808")
@@ -112,7 +108,7 @@ async def login(browser, tab):
 
     await take_screenshot(browser, tab, "01_login_page")
 
-    # 填写邮箱
+    # 填写邮箱（使用多种查找方式）
     try:
         email_el = await tab.find(tag_name="input", name="email", timeout=10)
     except:
@@ -135,7 +131,8 @@ async def login(browser, tab):
     await pass_el.click()
     await pass_el.type_text(PASSWORD, humanize=True)
 
-    # 验证码处理
+    # 验证码：识别后用 JS 直接注入输入框
+    captcha_code = None
     for _ in range(3):
         try:
             cap_img = await tab.find(id="allow_login_email_captcha", timeout=5)
@@ -152,18 +149,32 @@ async def login(browser, tab):
                 b64 = src.split(",", 1)[1]
                 img_bytes = base64.b64decode(b64)
                 raw = ocr.classification(img_bytes)
-                code = re.sub(r'[^0-9]', '', raw)
-                log.info(f"验证码识别: {raw} -> {code}")
-                try:
-                    cap_input = await tab.find("input", placeholder="请输入验证码", timeout=5)
-                except:
-                    cap_input = await tab.find("input", name="captcha", timeout=5)
-                await cap_input.click()
-                await cap_input.type_text(code, humanize=True)
+                captcha_code = re.sub(r'[^0-9]', '', raw)
+                log.info(f"验证码识别: {raw} -> {captcha_code}")
                 break
         await asyncio.sleep(1)
 
-    # 点击登录
+    if captcha_code:
+        # 使用 JS 填入验证码（兼容多种可能的输入框）
+        await tab.execute_script(f"""
+            (function() {{
+                var input = document.querySelector('#captcha_allow_login_email_captcha') ||
+                            document.querySelector('input[name="captcha"]') ||
+                            document.querySelector('input[placeholder*="验证码"]');
+                if (input) {{
+                    input.focus();
+                    input.value = '{captcha_code}';
+                    input.dispatchEvent(new Event('input', {{bubbles:true}}));
+                    input.dispatchEvent(new Event('change', {{bubbles:true}}));
+                }}
+            }})()
+        """)
+        log.info("验证码已通过 JS 填入")
+    else:
+        log.error("未能识别验证码")
+        return False
+
+    # 点击登录按钮
     try:
         login_btn = await tab.find(css="button.btn.btn-primary", timeout=10)
     except:
@@ -286,7 +297,6 @@ async def main():
         traceback.print_exc()
         await take_screenshot(browser, tab, "99_error")
     finally:
-        # 延长 5 秒，等待录屏结束
         await asyncio.sleep(5)
         await browser.__aexit__(None, None, None)
         log.info("任务结束")
