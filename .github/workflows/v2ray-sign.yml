@@ -17,15 +17,15 @@ jobs:
       - name: 设置 Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.12'   # 用 3.12 更稳定
 
-      - name: 安装系统依赖
+      - name: 安装系统依赖 (Chromium + ffmpeg + xvfb)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xvfb ffmpeg
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq chromium-browser xvfb ffmpeg curl unzip
 
       - name: 安装 Python 依赖
-        run: pip install pydoll ddddocr Pillow
+        run: pip install -r requirements.txt
 
       - name: 下载并启动 Xray 代理
         env:
@@ -35,35 +35,41 @@ jobs:
           unzip xray.zip && chmod +x xray
           echo "$V2RAY_CONFIG" > config.json
           ./xray run -c config.json &
-          sleep 3
+          sleep 5
           echo "直连 IP："
-          curl -s ifconfig.me
+          curl -s --max-time 5 ifconfig.me
+          echo ""
           echo "代理 IP："
-          curl -s --socks5 127.0.0.1:10808 ifconfig.me
+          curl -s --max-time 5 --socks5 127.0.0.1:10808 ifconfig.me
+          echo ""
 
       - name: 运行脚本 (带录屏)
         env:
           EMAIL: ${{ secrets.EMAIL }}
           PASSWORD: ${{ secrets.PASSWORD }}
+          HEADLESS: "true"          # 因为已有 xvfb，可以开无头
+          DISPLAY: ":99"
         run: |
           export DISPLAY=:99
-          Xvfb :99 -screen 0 1280x720x24 &
+          Xvfb :99 -screen 0 1280x720x24 +extension RANDR &
           sleep 1
-          # 启动录屏
-          ffmpeg -f x11grab -video_size 1280x720 -i :99 -codec:v libx264 -preset ultrafast -qp 0 output.mp4 &
-          FFMPEG_PID=$!
-          sleep 2
-          # 运行脚本
-          python sign_with_pydoll.py
-          # 停止录屏
-          kill $FFMPEG_PID
-          sleep 2
+          ffmpeg -f x11grab -video_size 1280x720 -i :99 \
+            -codec:v libx264 -preset ultrafast -crf 30 -t 300 \
+            -movflags +faststart /tmp/recording.mp4 &
+          RECORD_PID=$!
+          sleep 1
+          # 运行签到脚本（超时防止卡死）
+          timeout 280 python sign_pydoll_final.py || echo "脚本退出码: $?"
+          kill $RECORD_PID 2>/dev/null || true
+          wait $RECORD_PID 2>/dev/null || true
+          pkill Xvfb 2>/dev/null || true
 
       - name: 上传截图和录屏
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: results
+          name: debug-files
           path: |
-            screenshots/
-            output.mp4
+            ./screenshots/
+            /tmp/recording.mp4
+          retention-days: 3
