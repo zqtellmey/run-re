@@ -56,7 +56,7 @@ async def create_browser():
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
-    options.add_argument("--disable-blink-features=AutomationControlled")
+    # ❗️ 删除 --disable-blink-features=AutomationControlled，避免影响页面渲染
     options.add_argument("--password-store=basic")
     options.add_argument("--use-mock-keychain")
     options.add_argument("--proxy-server=socks5://127.0.0.1:10808")
@@ -135,7 +135,7 @@ async def login(browser, tab):
     await pass_el.click()
     await pass_el.type_text(PASSWORD, humanize=True)
 
-    # 验证码：基于你本地的 base64 图片提取逻辑
+    # 验证码处理
     for _ in range(3):
         try:
             cap_img = await tab.find(id="allow_login_email_captcha", timeout=5)
@@ -147,14 +147,17 @@ async def login(browser, tab):
             except:
                 cap_img = None
         if cap_img:
-            src = await cap_img.get_attribute("src")
+            src = cap_img.get_attribute("src")
             if src and src.startswith("data:image"):
                 b64 = src.split(",", 1)[1]
                 img_bytes = base64.b64decode(b64)
                 raw = ocr.classification(img_bytes)
-                code = re.sub(r'[^0-9]', '', raw)   # 只保留数字
+                code = re.sub(r'[^0-9]', '', raw)
                 log.info(f"验证码识别: {raw} -> {code}")
-                cap_input = await tab.find(tag_name="input", name="captcha", timeout=5)
+                try:
+                    cap_input = await tab.find("input", placeholder="请输入验证码", timeout=5)
+                except:
+                    cap_input = await tab.find("input", name="captcha", timeout=5)
                 await cap_input.click()
                 await cap_input.type_text(code, humanize=True)
                 break
@@ -283,7 +286,7 @@ async def main():
         traceback.print_exc()
         await take_screenshot(browser, tab, "99_error")
     finally:
-        # 延长 5 秒再退出，等录屏捕捉完整画面
+        # 延长 5 秒，等待录屏结束
         await asyncio.sleep(5)
         await browser.__aexit__(None, None, None)
         log.info("任务结束")
