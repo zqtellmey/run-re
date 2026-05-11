@@ -38,7 +38,10 @@ async def take_screenshot(browser, tab, name):
 
 async def get_text(tab):
     try:
-        return str(await tab.execute_script("return document.body.innerText"))
+        result = await tab.execute_script("return document.body.innerText")
+        if isinstance(result, dict):
+            return result.get("result", {}).get("result", {}).get("value", "")
+        return str(result)
     except:
         return ""
 
@@ -247,7 +250,17 @@ async def login(browser, tab, max_retries=3):
         await login_btn.click()
         await asyncio.sleep(5)
 
-        url = await tab.execute_script("return window.location.href")
+        url_result = await tab.execute_script("return window.location.href")
+        # execute_script 可能返回 dict（CDP 原始响应）或字符串，统一处理
+        if isinstance(url_result, dict):
+            url = (
+                url_result.get("result", {})
+                          .get("result", {})
+                          .get("value", "")
+            )
+        else:
+            url = str(url_result)
+        log.info(f"当前 URL: {url}")
         if "/clientarea" in url:
             log.info("✅ 登录成功")
             await take_screenshot(browser, tab, "02_login_success")
