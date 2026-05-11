@@ -15,11 +15,12 @@ LOGIN_URL = f"{BASE_URL}/login"
 USER_CENTER = f"{BASE_URL}/clientarea"
 SIGN_PAGE = f"{BASE_URL}/addons?_plugin=5&controller=index&action=index"
 
-SCREENSHOT_DIR = Path("./screenshots")
+# 截图目录：在GitHub Actions中自动使用工作区路径，本地运行时使用当前目录
+SCREENSHOT_DIR = Path(os.environ.get("GITHUB_WORKSPACE", ".")) / "screenshots"
 SCREENSHOT_DIR.mkdir(exist_ok=True)
 
 # ---------- Cookie 缓存 ----------
-COOKIE_FILE = Path("cookies.json")
+COOKIE_FILE = Path("./cookies.json")
 
 def load_cookies():
     if COOKIE_FILE.exists():
@@ -39,7 +40,6 @@ WXPUSHER_TOKEN = os.environ.get("WXPUSHER_TOKEN", "")
 WXPUSHER_UID   = os.environ.get("WXPUSHER_UID", "")
 
 def wxpush(content: str):
-    """发送 WxPusher 消息，失败只打日志不中断主流程"""
     if not WXPUSHER_TOKEN or not WXPUSHER_UID:
         log.warning("📨 WXPUSHER_TOKEN 或 WXPUSHER_UID 未配置，跳过推送")
         return
@@ -341,9 +341,9 @@ async def login(browser, tab, max_retries=3):
         if "/clientarea" in url:
             log.info("✅ 登录成功")
             await take_screenshot(browser, tab, "02_login_success")
-            # 保存 Cookie
+            # 保存 Cookie（用 browser 的 CDP 连接）
             try:
-                conn = getattr(tab, '_connection', None)
+                conn = getattr(browser, '_connection', None) or getattr(browser, 'connection', None)
                 if conn:
                     result = await conn.execute("Network.getCookies", {"urls": [BASE_URL, LOGIN_URL, USER_CENTER]})
                     cookie_list = [{
@@ -356,7 +356,7 @@ async def login(browser, tab, max_retries=3):
                     save_cookies(cookie_list)
                     log.info(f"已保存 {len(cookie_list)} 个 Cookie")
                 else:
-                    log.warning("无法获取 tab CDP 连接，跳过保存 Cookie")
+                    log.warning("无法获取 browser CDP 连接，跳过保存 Cookie")
             except Exception as e:
                 log.warning(f"保存 Cookie 失败: {e}")
             return True
