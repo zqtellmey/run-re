@@ -47,7 +47,7 @@ jobs:
         env:
           EMAIL: ${{ secrets.EMAIL }}
           PASSWORD: ${{ secrets.PASSWORD }}
-          HEADLESS: "true"          # 因为已有 xvfb，可以开无头
+          HEADLESS: "false"          # 因为已有 xvfb，可以开无头
           DISPLAY: ":99"
         run: |
           export DISPLAY=:99
