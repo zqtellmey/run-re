@@ -18,7 +18,8 @@ SIGN_PAGE = f"{BASE_URL}/addons?_plugin=5&controller=index&action=index"
 SCREENSHOT_DIR = Path("./screenshots")
 SCREENSHOT_DIR.mkdir(exist_ok=True)
 
-ocr = ddddocr.DdddOcr(show_ad=False)
+# 启用 beta 模式，提高数字识别率
+ocr = ddddocr.DdddOcr(beta=True, show_ad=False)
 
 # ---------- CDP 截图 ----------
 async def take_screenshot(browser, tab, name):
@@ -91,48 +92,9 @@ async def manual_cf_click(tab, timeout=15):
         await asyncio.sleep(1)
     return False
 
-# ---------- 登录 ----------
-async def login(browser, tab):
-    log.info("访问登录页...")
-    try:
-        async with tab.expect_and_bypass_cloudflare_captcha():
-            await tab.go_to(LOGIN_URL)
-    except Exception:
-        await tab.go_to(LOGIN_URL)
-
-    await asyncio.sleep(3)
-    body = await get_text(tab)
-    if "verify you are human" in body.lower() or "performing security verification" in body.lower():
-        if not await manual_cf_click(tab):
-            log.warning("Cloudflare 验证可能未完成")
-
-    await take_screenshot(browser, tab, "01_login_page")
-
-    # 填写邮箱（使用多种查找方式）
-    try:
-        email_el = await tab.find(tag_name="input", name="email", timeout=10)
-    except:
-        email_el = None
-    if not email_el:
-        email_el = await tab.find(placeholder="请输入邮箱地址", timeout=5)
-    if not email_el:
-        email_el = await tab.find(placeholder="请输入您的邮箱", timeout=5)
-    await email_el.click()
-    await email_el.type_text(EMAIL, humanize=True)
-    await human_delay()
-
-    # 填写密码
-    try:
-        pass_el = await tab.find(tag_name="input", name="password", timeout=5)
-    except:
-        pass_el = await tab.find(placeholder="请输入登录密码", timeout=5)
-    if not pass_el:
-        pass_el = await tab.find(placeholder="请输入您的密码", timeout=5)
-    await pass_el.click()
-    await pass_el.type_text(PASSWORD, humanize=True)
-
-    # 验证码：识别后用 JS 直接注入输入框
-    captcha_code = None
+# ---------- 获取并填入验证码 ----------
+async def fill_captcha(tab):
+    """返回验证码字符串，失败返回空"""
     for _ in range(3):
         try:
             cap_img = await tab.find(id="allow_login_email_captcha", timeout=5)
@@ -149,45 +111,111 @@ async def login(browser, tab):
                 b64 = src.split(",", 1)[1]
                 img_bytes = base64.b64decode(b64)
                 raw = ocr.classification(img_bytes)
-                captcha_code = re.sub(r'[^0-9]', '', raw)
-                log.info(f"验证码识别: {raw} -> {captcha_code}")
+                code = re.sub(r'[^0-9]', '', raw)
+                log.info(f"验证码识别: {raw} -> {code}")
+                # JS 注入验证码
+                await tab.execute_script(f"""
+                    (function() {{
+                        var input = document.querySelector('#captcha_allow_login_email_captcha') ||
+                                    document.querySelector('input[name="captcha"]') ||
+                                    document.querySelector('input[placeholder*="验证码"]');
+                        if (input) {{
+                            input.focus();
+                            input.value = '{code}';
+                            input.dispatchEvent(new Event('input', {{bubbles:true}}));
+                            input.dispatchEvent(new Event('change', {{bubbles:true}}));
+                        }}
+                    }})()
+                """)
+                return code
+        await asyncio.sleep(1)
+    return ""
+
+# ---------- 登录（支持重试）----------
+async def login(browser, tab, max_retries=3):
+    for attempt in range(1, max_retries + 1):
+        log.info(f"登录尝试 {attempt}/{max_retries}")
+        try:
+            async with tab.expect_and_bypass_cloudflare_captcha():
+                await tab.go_to(LOGIN_URL)
+        except Exception:
+            await tab.go_to(LOGIN_URL)
+
+        await asyncio.sleep(3)
+        body = await get_text(tab)
+        if "verify you are human" in body.lower() or "performing security verification" in body.lower():
+            if not await manual_cf_click(tab):
+                log.warning("Cloudflare 验证可能未完成")
+
+        # 处理邮箱输入框：确保为空再填入
+        email_el = None
+        for selector in [
+            {"tag_name": "input", "name": "email"},
+            {"placeholder": "请输入邮箱地址"},
+            {"placeholder": "请输入您的邮箱"},
+        ]:
+            try:
+                email_el = await tab.find(**selector, timeout=5)
                 break
+            except:
+                continue
+        if email_el:
+            await email_el.click()
+            # 清空已有内容（清除旧账号）
+            await email_el.type_text("", humanize=False)
+            await email_el.type_text(EMAIL, humanize=True)
+        else:
+            log.warning("未找到邮箱输入框")
+            continue
+
+        await human_delay()
+
+        # 处理密码输入框
+        pass_el = None
+        for selector in [
+            {"tag_name": "input", "name": "password"},
+            {"placeholder": "请输入登录密码"},
+            {"placeholder": "请输入您的密码"},
+        ]:
+            try:
+                pass_el = await tab.find(**selector, timeout=5)
+                break
+            except:
+                continue
+        if pass_el:
+            await pass_el.click()
+            # 清空已有内容
+            await pass_el.type_text("", humanize=False)
+            await pass_el.type_text(PASSWORD, humanize=True)
+        else:
+            log.warning("未找到密码输入框")
+            continue
+
+        # 获取验证码并填入
+        captcha_code = await fill_captcha(tab)
+        if not captcha_code:
+            log.warning("未能获取验证码，刷新重试")
+            continue
+
+        # 点击登录按钮
+        try:
+            login_btn = await tab.find(css="button.btn.btn-primary", timeout=10)
+        except:
+            login_btn = await tab.find(tag_name="button", text="登录", timeout=10)
+        await login_btn.click()
+        await asyncio.sleep(5)
+
+        url = await tab.execute_script("return window.location.href")
+        if "/clientarea" in url:
+            log.info("✅ 登录成功")
+            await take_screenshot(browser, tab, "02_login_success")
+            return True
+
+        log.warning(f"登录失败，当前 URL: {url}")
+        # 刷新页面，准备下一次重试
         await asyncio.sleep(1)
 
-    if captcha_code:
-        # 使用 JS 填入验证码（兼容多种可能的输入框）
-        await tab.execute_script(f"""
-            (function() {{
-                var input = document.querySelector('#captcha_allow_login_email_captcha') ||
-                            document.querySelector('input[name="captcha"]') ||
-                            document.querySelector('input[placeholder*="验证码"]');
-                if (input) {{
-                    input.focus();
-                    input.value = '{captcha_code}';
-                    input.dispatchEvent(new Event('input', {{bubbles:true}}));
-                    input.dispatchEvent(new Event('change', {{bubbles:true}}));
-                }}
-            }})()
-        """)
-        log.info("验证码已通过 JS 填入")
-    else:
-        log.error("未能识别验证码")
-        return False
-
-    # 点击登录按钮
-    try:
-        login_btn = await tab.find(css="button.btn.btn-primary", timeout=10)
-    except:
-        login_btn = await tab.find(tag_name="button", text="登录", timeout=10)
-    await login_btn.click()
-    await asyncio.sleep(5)
-
-    url = await tab.execute_script("return window.location.href")
-    if "/clientarea" in url:
-        log.info("✅ 登录成功")
-        await take_screenshot(browser, tab, "02_login_success")
-        return True
-    log.error(f"登录失败，当前 URL: {url}")
+    log.error("多次登录尝试均失败")
     return False
 
 # ---------- 签到 ----------
@@ -288,7 +316,8 @@ async def renew(browser, tab):
 async def main():
     browser, tab = await create_browser()
     try:
-        if not await login(browser, tab):
+        if not await login(browser, tab, max_retries=3):
+            log.error("登录失败，终止任务")
             return
         await sign(browser, tab)
         await renew(browser, tab)
