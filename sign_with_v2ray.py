@@ -5,13 +5,10 @@ import logging
 import traceback
 from datetime import datetime, timedelta
 
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
+import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from webdriver_manager.chrome import ChromeDriverManager
 import ddddocr
 
 logging.basicConfig(
@@ -42,20 +39,20 @@ def save_screenshot(driver, name):
     logging.info(f"📸 截图已保存: {filename}")
 
 def get_driver():
-    chrome_options = Options()
-    chrome_options.add_argument('--headless=new')
-    chrome_options.add_argument('--no-sandbox')
-    chrome_options.add_argument('--disable-dev-shm-usage')
-    chrome_options.add_argument('--disable-gpu')
-    chrome_options.add_argument('--window-size=1920,1080')
-    chrome_options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-    # 🔑 走 V2Ray 代理
-    chrome_options.add_argument('--proxy-server=socks5://127.0.0.1:10808')
-    service = Service(ChromeDriverManager().install())
-    return webdriver.Chrome(service=service, options=chrome_options)
+    options = uc.ChromeOptions()
+    options.add_argument('--headless=new')
+    options.add_argument('--no-sandbox')
+    options.add_argument('--disable-dev-shm-usage')
+    options.add_argument('--disable-gpu')
+    options.add_argument('--window-size=1920,1080')
+    options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+    # 代理，走 V2Ray socks5
+    options.add_argument('--proxy-server=socks5://127.0.0.1:10808')
+    driver = uc.Chrome(options=options)
+    return driver
 
+# ---- 以下函数完全不变，直接从之前的脚本复制过来即可 ----
 def recognize_captcha(driver):
-    """识别登录页图形验证码（base64）"""
     try:
         img_element = WebDriverWait(driver, 10).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, "img[src*='base64']"))
@@ -194,7 +191,7 @@ def renew_product(driver):
     save_screenshot(driver, "03_renew_complete")
 
 def main():
-    logging.info("===== 开始自动签到(V2Ray 代理) =====")
+    logging.info("===== 开始自动签到(V2Ray 代理 + undetected) =====")
     driver = get_driver()
     try:
         login(driver)
