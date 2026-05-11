@@ -1,4 +1,4 @@
-playwright
+playwright>=1.40
 ddddocr
 Pillow
 requests
