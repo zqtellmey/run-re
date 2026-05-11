@@ -43,7 +43,6 @@ jobs:
           curl -s --max-time 5 --socks5 127.0.0.1:10808 ifconfig.me
           echo ""
 
-      # 恢复缓存的 Cookie（如果存在）
       - name: 恢复 Cookie 缓存
         id: restore-cookies
         uses: actions/cache@v4
@@ -79,11 +78,12 @@ jobs:
           RECORD_PID=$!
           sleep 1
           timeout 285 python sign_pydoll_final.py || echo "脚本退出码: $?"
+          echo "=== 截图目录内容 ==="
+          ls -la ./screenshots/ || echo "截图目录不存在"
           kill $RECORD_PID 2>/dev/null || true
           wait $RECORD_PID 2>/dev/null || true
           pkill Xvfb 2>/dev/null || true
 
-      # 保存 Cookie 到缓存
       - name: 缓存 Cookie 到 GitHub Actions
         if: always()
         uses: actions/cache@v4
@@ -99,6 +99,6 @@ jobs:
         with:
           name: debug-files
           path: |
-            ${{ github.workspace }}/screenshots/
+            ./screenshots/
             /tmp/recording.mp4
           retention-days: 3
