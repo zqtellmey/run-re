@@ -48,7 +48,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ./cookies.json
-          key: runfreecloud-cookies-${{ github.ref_name }}
+          key: runfreecloud-cookies-main
           restore-keys: |
             runfreecloud-cookies-
 
@@ -89,9 +89,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ./cookies.json
-          key: runfreecloud-cookies-${{ github.ref_name }}-${{ github.run_id }}
-          restore-keys: |
-            runfreecloud-cookies-
+          key: runfreecloud-cookies-main
+          save-always: true
 
       - name: 上传截图和录屏
         if: always()
