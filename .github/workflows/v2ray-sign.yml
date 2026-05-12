@@ -43,23 +43,6 @@ jobs:
           curl -s --max-time 5 --socks5 127.0.0.1:10808 ifconfig.me
           echo ""
 
-      - name: 恢复 Cookie 缓存
-        id: restore-cookies
-        uses: actions/cache@v4
-        with:
-          path: ./cookies.json
-          key: runfreecloud-cookies-main
-          restore-keys: |
-            runfreecloud-cookies-
-
-      - name: 显示 Cookie 缓存状态
-        run: |
-          if [ -f cookies.json ]; then
-            echo "✅ 已恢复之前的登录 Cookie"
-          else
-            echo "ℹ️ 没有缓存的 Cookie，将要全新登录"
-          fi
-
       - name: 运行脚本 (带录屏)
         env:
           EMAIL: ${{ secrets.EMAIL }}
@@ -83,13 +66,6 @@ jobs:
           kill $RECORD_PID 2>/dev/null || true
           wait $RECORD_PID 2>/dev/null || true
           pkill Xvfb 2>/dev/null || true
-
-      - name: 缓存 Cookie 到 GitHub Actions
-        if: always()
-        uses: actions/cache@v4
-        with:
-          path: ./cookies.json
-          key: runfreecloud-cookies-main
 
       - name: 上传截图和录屏
         if: always()
