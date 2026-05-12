@@ -157,6 +157,10 @@ async def create_browser():
     opts.add_argument("--password-store=basic")
     opts.add_argument("--use-mock-keychain")
     opts.add_argument("--proxy-server=socks5://127.0.0.1:10808")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_argument("--exclude-switches=enable-automation")
+    opts.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
     opts.browser_preferences = {
         "credentials_enable_service": False,
         "profile": {"password_manager_enabled": False},
@@ -166,29 +170,63 @@ async def create_browser():
     return browser, tab
 
 # ---------- Cloudflare 交互 ----------
-async def manual_cf_click(tab, timeout=15):
-    log.info("尝试手动完成 Cloudflare 验证...")
+async def manual_cf_click(tab, timeout=30):
+    """
+    通过 CDP Input.dispatchMouseEvent 真实点击 Turnstile checkbox。
+    Turnstile iframe 是跨域的，JS无法访问其内部DOM，
+    必须用 CDP 在屏幕坐标上模拟真实鼠标事件。
+    """
+    log.info("尝试手动完成 Cloudflare 验证（CDP真实鼠标点击）...")
     for i in range(timeout):
         body = await get_text(tab)
-        if "email" in body or "登录" in body:
+        if "email" in body or "登录" in body or "请输入邮箱" in body:
+            log.info("✅ Cloudflare 验证已通过")
             return True
-        await tab.execute_script("""
+
+        # 获取 Turnstile iframe 的位置（在主页面坐标系中）
+        iframe_rect = await tab.execute_script("""
             (function() {
-                const checkboxes = document.querySelectorAll('iframe');
-                for (let iframe of checkboxes) {
-                    try {
-                        const doc = iframe.contentDocument || iframe.contentWindow.document;
-                        const cb = doc.querySelector('#checkbox, input[type="checkbox"]');
-                        if (cb) {
-                            cb.click();
-                            cb.dispatchEvent(new MouseEvent('click', {bubbles: true}));
-                            cb.dispatchEvent(new Event('change', {bubbles: true}));
-                        }
-                    } catch(e) {}
+                const iframes = document.querySelectorAll('iframe');
+                for (let f of iframes) {
+                    const src = f.src || '';
+                    if (src.includes('cloudflare') || src.includes('challenges') || src.includes('turnstile')) {
+                        const r = f.getBoundingClientRect();
+                        return {x: r.left, y: r.top, w: r.width, h: r.height, found: true};
+                    }
                 }
+                // fallback: 取第一个 iframe
+                const f = document.querySelector('iframe');
+                if (f) {
+                    const r = f.getBoundingClientRect();
+                    return {x: r.left, y: r.top, w: r.width, h: r.height, found: true};
+                }
+                return {found: false};
             })()
         """)
+
+        if iframe_rect and iframe_rect.get("found"):
+            # Turnstile checkbox 大约在 iframe 左侧 25px 处，垂直居中
+            click_x = iframe_rect["x"] + 25
+            click_y = iframe_rect["y"] + iframe_rect["h"] / 2
+            log.info(f"点击 Cloudflare iframe checkbox 坐标: ({click_x:.0f}, {click_y:.0f})")
+            try:
+                # 用 pydoll CDP 发送真实鼠标事件
+                await tab.execute_script(f"""
+                    (function() {{
+                        // 用 elementFromPoint 找到 iframe 元素并 focus
+                        const el = document.elementFromPoint({click_x}, {click_y});
+                        if (el) el.focus();
+                    }})()
+                """)
+                # pydoll 提供 click 坐标点击
+                await tab.click(x=int(click_x), y=int(click_y))
+            except Exception as e:
+                log.warning(f"CDP点击失败: {e}")
+        else:
+            log.info(f"第{i+1}s: 未找到 Cloudflare iframe，等待中...")
+
         await asyncio.sleep(1)
+    log.error("Cloudflare 验证超时")
     return False
 
 # ---------- 验证码处理 ----------
@@ -275,10 +313,14 @@ async def login(browser, tab, max_retries=3):
         except:
             await tab.go_to(LOGIN_URL)
 
-        await asyncio.sleep(2)
+        await asyncio.sleep(3)
         body = await get_text(tab)
-        if "verify you are human" in body.lower():
-            await manual_cf_click(tab)
+        if "verify you are human" in body.lower() or "cloudflare" in body.lower():
+            success = await manual_cf_click(tab)
+            if not success:
+                log.error("Cloudflare 验证失败，截图后重试")
+                await take_screenshot(browser, tab, f"cf_fail_{attempt}")
+                continue
 
         # 填写邮箱密码
         try:
