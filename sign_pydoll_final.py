@@ -8,6 +8,7 @@ import ddddocr
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
+# ---------- 全局配置 ----------
 EMAIL = os.environ["EMAIL"]
 PASSWORD = os.environ["PASSWORD"]
 BASE_URL = "https://run.freecloud.ltd"
@@ -98,9 +99,19 @@ async def human_delay(min_s=0.3, max_s=0.8):
     await asyncio.sleep(random.uniform(min_s, max_s))
 
 async def wait_for_url_contains(tab, keyword, timeout=10):
+    """轮询等待 URL 包含指定关键字"""
     for _ in range(timeout):
         url = await get_url(tab)
         if keyword in url:
+            return True
+        await asyncio.sleep(0.5)
+    return False
+
+async def wait_for_element_by_text(tab, text, timeout=10):
+    """轮询等待页面出现指定文字"""
+    for _ in range(timeout * 2):
+        body = await get_text(tab)
+        if text in body:
             return True
         await asyncio.sleep(0.5)
     return False
@@ -146,6 +157,11 @@ async def create_browser():
     opts.add_argument("--password-store=basic")
     opts.add_argument("--use-mock-keychain")
     opts.add_argument("--proxy-server=socks5://127.0.0.1:10808")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_argument("--exclude-switches=enable-automation")
+    opts.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+    # 伪造有历史的浏览器 Profile，减少 CF 触发验证概率
     import time as _time
     fake_engagement_time = int(_time.time()) - random.randint(7, 30) * 24 * 60 * 60
     opts.browser_preferences = {
@@ -163,31 +179,62 @@ async def create_browser():
         "intl": {"accept_languages": "en-US,en"},
         "session": {"restore_on_startup": 1},
     }
+    opts.webrtc_leak_protection = True
     browser = await Chrome(options=opts).__aenter__()
     tab = await browser.start()
     return browser, tab
 
 # ---------- Cloudflare 交互 ----------
-async def handle_cf_verification(tab, timeout=30):
-    """处理 Cloudflare Turnstile 验证，等待自动完成或手动点击"""
-    log.info("检测到 Cloudflare 验证页面...")
+async def manual_cf_click(tab, timeout=30):
+    """
+    通过 pydoll 的 Shadow DOM 穿透能力点击 Cloudflare Turnstile checkbox。
+    CF Turnstile 的 checkbox (span.cb-i) 藏在多层 Shadow DOM 里，
+    普通 document.querySelector 和 JS 注入都找不到，
+    必须用 pydoll 的 find_shadow_roots() + ShadowRoot.query() 穿透访问。
+    """
+    log.info("尝试手动完成 Cloudflare 验证（Shadow DOM 穿透点击）...")
     for i in range(timeout):
         body = await get_text(tab)
-        if "email" in body or "登录" in body or "请输入邮箱" in body or "我要签到" in body or "用户中心" in body:
+        if "email" in body or "登录" in body or "请输入邮箱" in body:
             log.info("✅ Cloudflare 验证已通过")
             return True
 
-        if "Verify you are human" in body and "cloudflare" in body.lower():
-            # 页面有验证框，等待自动通过或偶尔手动点击
-            if i % 3 == 0:
+        try:
+            # 第一层：找到包含 Turnstile iframe 的 Shadow Root
+            shadow_roots = await tab.find_shadow_roots(deep=False)
+            log.info(f"第{i+1}s: 找到 {len(shadow_roots)} 个 shadow root")
+
+            cf_shadow = None
+            for sr in shadow_roots:
                 try:
-                    # 尝试点击一下页面以触发自动验证
-                    await tab.execute_script("document.body.click()")
-                except:
+                    html = await sr.inner_html
+                    if "challenges.cloudflare.com" in html:
+                        cf_shadow = sr
+                        break
+                except Exception:
                     pass
-            await asyncio.sleep(1)
-            log.info(f"等待CF验证... {i+1}s")
-            continue
+
+            if cf_shadow is None:
+                await asyncio.sleep(1)
+                continue
+
+            log.info("找到 Cloudflare Shadow Root，尝试进入 iframe...")
+            # 第二层：在 shadow root 里找 CF iframe
+            iframe_el = await cf_shadow.query('iframe[src*="challenges.cloudflare.com"]', timeout=3)
+            # 第三层：进入 iframe body 的 shadow root，找 checkbox
+            body_el = await iframe_el.find(tag_name="body", timeout=3)
+            inner_shadow = await body_el.get_shadow_root(timeout=3)
+            checkbox = await inner_shadow.query("span.cb-i", timeout=3)
+            await checkbox.click()
+            log.info("✅ 已点击 Cloudflare checkbox，等待验证...")
+            await asyncio.sleep(3)
+            body2 = await get_text(tab)
+            if "email" in body2 or "登录" in body2 or "请输入邮箱" in body2:
+                log.info("✅ 点击后验证通过")
+                return True
+
+        except Exception as e:
+            log.info(f"第{i+1}s: {e}")
 
         await asyncio.sleep(1)
     log.error("Cloudflare 验证超时")
@@ -265,7 +312,7 @@ async def save_session_cookies(tab):
         log.warning(f"保存 Cookie 失败: {e}")
 
 # ---------- 登录 ----------
-async def login(browser, tab, max_retries=2):
+async def login(browser, tab, max_retries=3):
     if await try_restore_cookies(tab):
         return True
 
@@ -277,10 +324,25 @@ async def login(browser, tab, max_retries=2):
         except:
             await tab.go_to(LOGIN_URL)
 
-        # 等待 CF 验证通过
-        if not await handle_cf_verification(tab, timeout=15):
-            log.error("CF 验证失败，重试")
-            continue
+        # 等待 CF 验证完成（pydoll 的 expect_and_bypass 可能需要几秒）
+        # 最多等 15s，每秒检查一次是否已到达登录页
+        cf_passed = False
+        for _w in range(15):
+            await asyncio.sleep(1)
+            body = await get_text(tab)
+            if "verify you are human" not in body.lower() and "cloudflare" not in body.lower():
+                cf_passed = True
+                break
+            log.info(f"等待CF验证... {_w+1}s")
+
+        if not cf_passed:
+            # pydoll bypass 没能自动过，尝试手动坐标点击
+            log.warning("pydoll bypass 未能自动过CF，尝试手动点击...")
+            success = await manual_cf_click(tab)
+            if not success:
+                log.error("Cloudflare 验证失败，截图后重试")
+                await take_screenshot(browser, tab, f"cf_fail_{attempt}")
+                continue
 
         # 填写邮箱密码
         try:
@@ -303,13 +365,16 @@ async def login(browser, tab, max_retries=2):
             log.warning("验证码识别失败，重试")
             continue
 
+        # 点击登录（pydoll CSS selector 必须用 query()，find() 不支持 css= 参数）
         try:
             login_btn = await tab.query("button.btn.btn-primary", timeout=5)
         except Exception:
+            # fallback: 按文字找
             login_btn = await tab.find(tag_name="button", text="登录", timeout=5)
         await login_btn.click()
-        log.info("已点击登录，检查跳转...")
+        log.info("已点击登录，立即检查跳转...")
 
+        # ✅ 核心修复：不再死等5秒，而是快速轮询 URL
         if await wait_for_url_contains(tab, "/clientarea", 8):
             log.info("✅ 登录成功")
             await take_screenshot(browser, tab, "02_login_success")
@@ -328,39 +393,17 @@ async def sign(browser, tab):
     except:
         await tab.go_to(SIGN_PAGE)
 
-    # 检测是否出现 CF 验证
-    body = await get_text(tab)
-    if "cloudflare" in body.lower() or "verify you are human" in body.lower():
-        log.info("签到页出现 CF 验证，等待完成...")
-        if not await handle_cf_verification(tab, timeout=15):
-            log.error("签到页 CF 验证失败")
-            await take_screenshot(browser, tab, "02_cf_fail")
-            return None, None
-
-    # 重新检查页面内容
-    await asyncio.sleep(2)
-    body = await get_text(tab)
-    url = await get_url(tab)
-
-    # 判断是否真的已签到
-    if "今日已签到" in body or await tab.find(tag_name="button", text="我要签到", timeout=3, raise_exc=False) is None:
-        # 尝试提取现有余额
-        bal = re.search(r'账户余额剩余\s*([\d.]+)\s*积分', body)
-        balance = bal.group(1) if bal else None
-        log.info("已经签到过了（或按钮不存在）")
+    # ✅ 等待签到按钮出现，而不是死等3秒
+    if not await wait_for_element_by_text(tab, "我要签到", 10):
+        log.info("可能已经签到过了")
         await take_screenshot(browser, tab, "02_sign_skip")
-        return balance, None
+        return None
 
-    # 点击签到按钮
-    try:
-        btn = await tab.find(tag_name="button", text="我要签到", timeout=5)
-        await btn.click()
-    except:
-        log.info("找不到签到按钮，可能已签到")
-        await take_screenshot(browser, tab, "02_sign_skip")
-        return None, None
-
+    btn = await tab.find(tag_name="button", text="我要签到", timeout=5)
+    await btn.click()
     await asyncio.sleep(1)
+
+    # 数学题
     text = await get_text(tab)
     match = re.search(r'请计算[：:]\s*(\d+)\s*([+\-*/])\s*(\d+)', text)
     if match:
@@ -390,7 +433,7 @@ async def sign(browser, tab):
     await take_screenshot(browser, tab, "03_sign_complete")
     text = await get_text(tab)
     bal = re.search(r'账户余额剩余\s*([\d.]+)\s*积分', text)
-    return (bal.group(1) if bal else None), None
+    return bal.group(1) if bal else None
 
 # ---------- 续费 ----------
 async def renew(browser, tab):
@@ -400,72 +443,49 @@ async def renew(browser, tab):
     text = await get_text(tab)
     match = re.search(r'(\d{4}-\d{2}-\d{2})', text)
     if not match:
-        return False, None, None
+        return
     expiry_str = match.group(1)
     expiry = datetime.strptime(expiry_str, "%Y-%m-%d")
     remain = (expiry - datetime.now()).days
     log.info(f"到期: {expiry_str}，剩余 {remain} 天")
     if remain > 1:
         log.info("暂不续费")
-        return False, expiry_str, remain
+        return
 
     try:
         renew_btn = await tab.find(tag_name="button", text="续费", timeout=5)
         await renew_btn.click()
         await asyncio.sleep(1)
-        await tab.find(tag_name="button", text="立即续费", timeout=5).click()
+        renew_confirm = await tab.find(tag_name="button", text="立即续费", timeout=5)
+        await renew_confirm.click()
         await asyncio.sleep(1)
-        await tab.find(tag_name="button", text="立即支付", timeout=5).click()
+        pay_btn = await tab.find(tag_name="button", text="立即支付", timeout=5)
+        await pay_btn.click()
         await asyncio.sleep(1)
         ok = await tab.find(tag_name="button", text="确定", timeout=3)
         await ok.click()
         log.info("✅ 续费完成")
         await take_screenshot(browser, tab, "04_renew_complete")
-        return True, expiry_str, remain
     except:
         log.warning("续费流程异常")
-        return False, expiry_str, remain
 
-# ---------- 主流程 ----------
 async def main():
     browser, tab = await create_browser()
     try:
         if not await login(browser, tab):
             wxpush("❌ 登录失败")
             return
-
-        balance, _ = await sign(browser, tab)
-        renewed, expiry_str, remain = await renew(browser, tab)
-
-        # 如果签到没有拿到余额，尝试从续费页面（用户中心）获取
-        if balance is None and expiry_str:
-            await tab.go_to(USER_CENTER)
-            await asyncio.sleep(2)
-            text = await get_text(tab)
-            bal = re.search(r'账户余额剩余\s*([\d.]+)\s*积分', text)
-            if bal:
-                balance = bal.group(1)
-
+        balance = await sign(browser, tab)
+        await renew(browser, tab)
         lines = ["✅ 签到成功"]
-        if balance is not None:
-            lines.append(f"账户余额剩余 {balance} 积分")
-        if expiry_str:
-            lines.append(f"到期时间 {expiry_str}")
-            if renewed:
-                lines.append("已自动续期")
-            else:
-                renew_date = (datetime.strptime(expiry_str, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
-                lines.append(f"不用续期 等到 {renew_date} 再续期")
+        if balance:
+            lines.append(f"账户余额 {balance} 积分")
         wxpush("\n".join(lines))
-
     except Exception as e:
         log.exception(e)
         await take_screenshot(browser, tab, "99_error")
-        wxpush(f"❌ Runfreecloud 任务异常: {e}")
     finally:
-        await asyncio.sleep(5)
         await browser.__aexit__(None, None, None)
-        log.info("任务结束")
 
 if __name__ == "__main__":
     asyncio.run(main())
