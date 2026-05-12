@@ -170,11 +170,23 @@ async def create_browser():
     return browser, tab
 
 # ---------- Cloudflare 交互 ----------
+def _extract_js_value(response):
+    """从 pydoll execute_script 返回值中提取 JS 侧的实际值。
+    response 结构: {'id':..., 'result': {'result': {'type':..., 'value':...}}}
+    """
+    if not isinstance(response, dict):
+        return None
+    # 兼容两种可能的嵌套层级
+    inner = response.get("result", {})
+    if "result" in inner:
+        inner = inner["result"]
+    return inner.get("value")
+
 async def manual_cf_click(tab, timeout=30):
     """
-    通过 CDP Input.dispatchMouseEvent 真实点击 Turnstile checkbox。
-    Turnstile iframe 是跨域的，JS无法访问其内部DOM，
-    必须用 CDP 在屏幕坐标上模拟真实鼠标事件。
+    通过 pydoll tab.mouse.click() 在屏幕坐标上真实点击 Turnstile checkbox。
+    Turnstile iframe 跨域，JS 无法访问其内部 DOM，
+    必须通过 CDP 鼠标事件在页面坐标系上点击。
     """
     log.info("尝试手动完成 Cloudflare 验证（CDP真实鼠标点击）...")
     for i in range(timeout):
@@ -183,47 +195,53 @@ async def manual_cf_click(tab, timeout=30):
             log.info("✅ Cloudflare 验证已通过")
             return True
 
-        # 获取 Turnstile iframe 的位置（在主页面坐标系中）
-        iframe_rect = await tab.execute_script("""
+        # 通过 JS 获取 Turnstile iframe 在页面中的坐标
+        # execute_script 返回 JSON 序列化后的对象会放在 result.result.value 里
+        raw = await tab.execute_script("""
             (function() {
                 const iframes = document.querySelectorAll('iframe');
                 for (let f of iframes) {
                     const src = f.src || '';
                     if (src.includes('cloudflare') || src.includes('challenges') || src.includes('turnstile')) {
                         const r = f.getBoundingClientRect();
-                        return {x: r.left, y: r.top, w: r.width, h: r.height, found: true};
+                        return JSON.stringify({x: r.left, y: r.top, w: r.width, h: r.height, found: true});
                     }
                 }
-                // fallback: 取第一个 iframe
                 const f = document.querySelector('iframe');
                 if (f) {
                     const r = f.getBoundingClientRect();
-                    return {x: r.left, y: r.top, w: r.width, h: r.height, found: true};
+                    return JSON.stringify({x: r.left, y: r.top, w: r.width, h: r.height, found: true});
                 }
-                return {found: false};
+                return JSON.stringify({found: false});
             })()
         """)
 
+        val = _extract_js_value(raw)
+        iframe_rect = None
+        if val:
+            try:
+                iframe_rect = json.loads(val)
+            except Exception:
+                pass
+
+        log.info(f"第{i+1}s: iframe_rect={iframe_rect}")
+
         if iframe_rect and iframe_rect.get("found"):
-            # Turnstile checkbox 大约在 iframe 左侧 25px 处，垂直居中
+            # Turnstile checkbox 在 iframe 内左侧约 25px，垂直居中
             click_x = iframe_rect["x"] + 25
             click_y = iframe_rect["y"] + iframe_rect["h"] / 2
-            log.info(f"点击 Cloudflare iframe checkbox 坐标: ({click_x:.0f}, {click_y:.0f})")
+            log.info(f"点击 Cloudflare checkbox 坐标: ({click_x:.0f}, {click_y:.0f})")
             try:
-                # 用 pydoll CDP 发送真实鼠标事件
-                await tab.execute_script(f"""
-                    (function() {{
-                        // 用 elementFromPoint 找到 iframe 元素并 focus
-                        const el = document.elementFromPoint({click_x}, {click_y});
-                        if (el) el.focus();
-                    }})()
-                """)
-                # pydoll 提供 click 坐标点击
-                await tab.click(x=int(click_x), y=int(click_y))
+                # pydoll 2.x 正确 API: tab.mouse.click(x, y)
+                await tab.mouse.click(click_x, click_y)
+                log.info("已发送鼠标点击事件，等待验证结果...")
+                await asyncio.sleep(3)
+                body2 = await get_text(tab)
+                if "email" in body2 or "登录" in body2 or "请输入邮箱" in body2:
+                    log.info("✅ 点击后验证通过")
+                    return True
             except Exception as e:
-                log.warning(f"CDP点击失败: {e}")
-        else:
-            log.info(f"第{i+1}s: 未找到 Cloudflare iframe，等待中...")
+                log.warning(f"mouse.click 失败: {e}")
 
         await asyncio.sleep(1)
     log.error("Cloudflare 验证超时")
