@@ -161,87 +161,80 @@ async def create_browser():
     opts.add_argument("--disable-blink-features=AutomationControlled")
     opts.add_argument("--exclude-switches=enable-automation")
     opts.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+    # 伪造有历史的浏览器 Profile，减少 CF 触发验证概率
+    import time as _time
+    fake_engagement_time = int(_time.time()) - random.randint(7, 30) * 24 * 60 * 60
     opts.browser_preferences = {
         "credentials_enable_service": False,
-        "profile": {"password_manager_enabled": False},
+        "profile": {
+            "password_manager_enabled": False,
+            "last_engagement_time": fake_engagement_time,
+            "exit_type": "Normal",
+            "exited_cleanly": True,
+            "default_content_setting_values": {
+                "notifications": 2,
+                "geolocation": 2,
+            },
+        },
+        "intl": {"accept_languages": "en-US,en"},
+        "session": {"restore_on_startup": 1},
     }
+    opts.webrtc_leak_protection = True
     browser = await Chrome(options=opts).__aenter__()
     tab = await browser.start()
     return browser, tab
 
 # ---------- Cloudflare 交互 ----------
-def _extract_js_value(response):
-    """从 pydoll execute_script 返回值中提取 JS 侧的实际值。
-    response 结构: {'id':..., 'result': {'result': {'type':..., 'value':...}}}
-    """
-    if not isinstance(response, dict):
-        return None
-    # 兼容两种可能的嵌套层级
-    inner = response.get("result", {})
-    if "result" in inner:
-        inner = inner["result"]
-    return inner.get("value")
-
 async def manual_cf_click(tab, timeout=30):
     """
-    通过 pydoll tab.mouse.click() 在屏幕坐标上真实点击 Turnstile checkbox。
-    Turnstile iframe 跨域，JS 无法访问其内部 DOM，
-    必须通过 CDP 鼠标事件在页面坐标系上点击。
+    通过 pydoll 的 Shadow DOM 穿透能力点击 Cloudflare Turnstile checkbox。
+    CF Turnstile 的 checkbox (span.cb-i) 藏在多层 Shadow DOM 里，
+    普通 document.querySelector 和 JS 注入都找不到，
+    必须用 pydoll 的 find_shadow_roots() + ShadowRoot.query() 穿透访问。
     """
-    log.info("尝试手动完成 Cloudflare 验证（CDP真实鼠标点击）...")
+    log.info("尝试手动完成 Cloudflare 验证（Shadow DOM 穿透点击）...")
     for i in range(timeout):
         body = await get_text(tab)
         if "email" in body or "登录" in body or "请输入邮箱" in body:
             log.info("✅ Cloudflare 验证已通过")
             return True
 
-        # 通过 JS 获取 Turnstile iframe 在页面中的坐标
-        # execute_script 返回 JSON 序列化后的对象会放在 result.result.value 里
-        raw = await tab.execute_script("""
-            (function() {
-                const iframes = document.querySelectorAll('iframe');
-                for (let f of iframes) {
-                    const src = f.src || '';
-                    if (src.includes('cloudflare') || src.includes('challenges') || src.includes('turnstile')) {
-                        const r = f.getBoundingClientRect();
-                        return JSON.stringify({x: r.left, y: r.top, w: r.width, h: r.height, found: true});
-                    }
-                }
-                const f = document.querySelector('iframe');
-                if (f) {
-                    const r = f.getBoundingClientRect();
-                    return JSON.stringify({x: r.left, y: r.top, w: r.width, h: r.height, found: true});
-                }
-                return JSON.stringify({found: false});
-            })()
-        """)
+        try:
+            # 第一层：找到包含 Turnstile iframe 的 Shadow Root
+            shadow_roots = await tab.find_shadow_roots(deep=False)
+            log.info(f"第{i+1}s: 找到 {len(shadow_roots)} 个 shadow root")
 
-        val = _extract_js_value(raw)
-        iframe_rect = None
-        if val:
-            try:
-                iframe_rect = json.loads(val)
-            except Exception:
-                pass
+            cf_shadow = None
+            for sr in shadow_roots:
+                try:
+                    html = await sr.inner_html
+                    if "challenges.cloudflare.com" in html:
+                        cf_shadow = sr
+                        break
+                except Exception:
+                    pass
 
-        log.info(f"第{i+1}s: iframe_rect={iframe_rect}")
+            if cf_shadow is None:
+                await asyncio.sleep(1)
+                continue
 
-        if iframe_rect and iframe_rect.get("found"):
-            # Turnstile checkbox 在 iframe 内左侧约 25px，垂直居中
-            click_x = iframe_rect["x"] + 25
-            click_y = iframe_rect["y"] + iframe_rect["h"] / 2
-            log.info(f"点击 Cloudflare checkbox 坐标: ({click_x:.0f}, {click_y:.0f})")
-            try:
-                # pydoll 2.x 正确 API: tab.mouse.click(x, y)
-                await tab.mouse.click(click_x, click_y)
-                log.info("已发送鼠标点击事件，等待验证结果...")
-                await asyncio.sleep(3)
-                body2 = await get_text(tab)
-                if "email" in body2 or "登录" in body2 or "请输入邮箱" in body2:
-                    log.info("✅ 点击后验证通过")
-                    return True
-            except Exception as e:
-                log.warning(f"mouse.click 失败: {e}")
+            log.info("找到 Cloudflare Shadow Root，尝试进入 iframe...")
+            # 第二层：在 shadow root 里找 CF iframe
+            iframe_el = await cf_shadow.query('iframe[src*="challenges.cloudflare.com"]', timeout=3)
+            # 第三层：进入 iframe body 的 shadow root，找 checkbox
+            body_el = await iframe_el.find(tag_name="body", timeout=3)
+            inner_shadow = await body_el.get_shadow_root(timeout=3)
+            checkbox = await inner_shadow.query("span.cb-i", timeout=3)
+            await checkbox.click()
+            log.info("✅ 已点击 Cloudflare checkbox，等待验证...")
+            await asyncio.sleep(3)
+            body2 = await get_text(tab)
+            if "email" in body2 or "登录" in body2 or "请输入邮箱" in body2:
+                log.info("✅ 点击后验证通过")
+                return True
+
+        except Exception as e:
+            log.info(f"第{i+1}s: {e}")
 
         await asyncio.sleep(1)
     log.error("Cloudflare 验证超时")
