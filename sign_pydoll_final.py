@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 from pydoll.browser.chromium import Chrome
 from pydoll.browser.options import ChromiumOptions
 import ddddocr
-import requests                     # 用于代理连通性检查
+import requests
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -61,7 +61,6 @@ def check_proxy():
             'http': 'socks5h://127.0.0.1:10808',
             'https': 'socks5h://127.0.0.1:10808',
         }
-        # 只测试能否建立连接，超时短一些
         resp = session.get(BASE_URL, timeout=8)
         log.info(f"代理连通性检查: 状态码 {resp.status_code}")
         return resp.status_code < 500
@@ -259,7 +258,7 @@ async def login(browser, tab, max_retries=2):
         log.info("已点击登录，检查跳转...")
 
         # 快速轮询检查是否登录成功
-        for _ in range(12):   # 最长约 6 秒
+        for _ in range(12):
             url = await tab.execute_script("return window.location.href")
             if isinstance(url, dict):
                 url = url.get("result", {}).get("result", {}).get("value", "")
@@ -276,8 +275,7 @@ async def login(browser, tab, max_retries=2):
 async def sign(browser, tab):
     log.info("前往签到页...")
     await tab.go_to(SIGN_PAGE)
-    # 等待签到按钮出现
-    for _ in range(10):   # 最长 5 秒
+    for _ in range(10):
         body = await get_text(tab)
         if "我要签到" in body:
             break
