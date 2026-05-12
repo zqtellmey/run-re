@@ -417,7 +417,8 @@ async def sign(browser, tab):
         ans_el = await tab.find(placeholder="请输入答案", timeout=5)
         await ans_el.click()
         await ans_el.type_text(result_str, humanize=True)
-        await tab.find(tag_name="button", text="验证答案", timeout=5).click()
+        ver_btn = await tab.find(tag_name="button", text="验证答案", timeout=5)
+        await ver_btn.click()
         await asyncio.sleep(1)
 
     for _ in range(2):
@@ -455,9 +456,11 @@ async def renew(browser, tab):
         renew_btn = await tab.find(tag_name="button", text="续费", timeout=5)
         await renew_btn.click()
         await asyncio.sleep(1)
-        await tab.find(tag_name="button", text="立即续费", timeout=5).click()
+        renew_confirm = await tab.find(tag_name="button", text="立即续费", timeout=5)
+        await renew_confirm.click()
         await asyncio.sleep(1)
-        await tab.find(tag_name="button", text="立即支付", timeout=5).click()
+        pay_btn = await tab.find(tag_name="button", text="立即支付", timeout=5)
+        await pay_btn.click()
         await asyncio.sleep(1)
         ok = await tab.find(tag_name="button", text="确定", timeout=3)
         await ok.click()
