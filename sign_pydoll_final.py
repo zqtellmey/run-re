@@ -331,9 +331,20 @@ async def login(browser, tab, max_retries=3):
         except:
             await tab.go_to(LOGIN_URL)
 
-        await asyncio.sleep(3)
-        body = await get_text(tab)
-        if "verify you are human" in body.lower() or "cloudflare" in body.lower():
+        # 等待 CF 验证完成（pydoll 的 expect_and_bypass 可能需要几秒）
+        # 最多等 15s，每秒检查一次是否已到达登录页
+        cf_passed = False
+        for _w in range(15):
+            await asyncio.sleep(1)
+            body = await get_text(tab)
+            if "verify you are human" not in body.lower() and "cloudflare" not in body.lower():
+                cf_passed = True
+                break
+            log.info(f"等待CF验证... {_w+1}s")
+
+        if not cf_passed:
+            # pydoll bypass 没能自动过，尝试手动坐标点击
+            log.warning("pydoll bypass 未能自动过CF，尝试手动点击...")
             success = await manual_cf_click(tab)
             if not success:
                 log.error("Cloudflare 验证失败，截图后重试")
@@ -361,8 +372,12 @@ async def login(browser, tab, max_retries=3):
             log.warning("验证码识别失败，重试")
             continue
 
-        # 点击登录
-        login_btn = await tab.find(css="button.btn.btn-primary", timeout=5)
+        # 点击登录（pydoll CSS selector 必须用 query()，find() 不支持 css= 参数）
+        try:
+            login_btn = await tab.query("button.btn.btn-primary", timeout=5)
+        except Exception:
+            # fallback: 按文字找
+            login_btn = await tab.find(tag_name="button", text="登录", timeout=5)
         await login_btn.click()
         log.info("已点击登录，立即检查跳转...")
 
