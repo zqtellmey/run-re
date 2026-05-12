@@ -53,7 +53,7 @@ def wxpush(content: str):
 
 ocr = ddddocr.DdddOcr(beta=True, show_ad=False)
 
-# ---------- Cookie 管理 ----------
+# ---------- 工具函数 ----------
 def load_cookies():
     if COOKIE_FILE.exists():
         try:
@@ -101,14 +101,6 @@ async def wait_for_url_contains(tab, keyword, timeout=10):
     for _ in range(timeout):
         url = await get_url(tab)
         if keyword in url:
-            return True
-        await asyncio.sleep(0.5)
-    return False
-
-async def wait_for_element_by_text(tab, text, timeout=10):
-    for _ in range(timeout * 2):
-        body = await get_text(tab)
-        if text in body:
             return True
         await asyncio.sleep(0.5)
     return False
@@ -176,47 +168,26 @@ async def create_browser():
     return browser, tab
 
 # ---------- Cloudflare 交互 ----------
-async def manual_cf_click(tab, timeout=30):
-    log.info("尝试手动完成 Cloudflare 验证（Shadow DOM 穿透点击）...")
+async def handle_cf_verification(tab, timeout=30):
+    """处理 Cloudflare Turnstile 验证，等待自动完成或手动点击"""
+    log.info("检测到 Cloudflare 验证页面...")
     for i in range(timeout):
         body = await get_text(tab)
-        if "email" in body or "登录" in body or "请输入邮箱" in body:
+        if "email" in body or "登录" in body or "请输入邮箱" in body or "我要签到" in body or "用户中心" in body:
             log.info("✅ Cloudflare 验证已通过")
             return True
 
-        try:
-            shadow_roots = await tab.find_shadow_roots(deep=False)
-            log.info(f"第{i+1}s: 找到 {len(shadow_roots)} 个 shadow root")
-
-            cf_shadow = None
-            for sr in shadow_roots:
+        if "Verify you are human" in body and "cloudflare" in body.lower():
+            # 页面有验证框，等待自动通过或偶尔手动点击
+            if i % 3 == 0:
                 try:
-                    html = await sr.inner_html
-                    if "challenges.cloudflare.com" in html:
-                        cf_shadow = sr
-                        break
-                except Exception:
+                    # 尝试点击一下页面以触发自动验证
+                    await tab.execute_script("document.body.click()")
+                except:
                     pass
-
-            if cf_shadow is None:
-                await asyncio.sleep(1)
-                continue
-
-            log.info("找到 Cloudflare Shadow Root，尝试进入 iframe...")
-            iframe_el = await cf_shadow.query('iframe[src*="challenges.cloudflare.com"]', timeout=3)
-            body_el = await iframe_el.find(tag_name="body", timeout=3)
-            inner_shadow = await body_el.get_shadow_root(timeout=3)
-            checkbox = await inner_shadow.query("span.cb-i", timeout=3)
-            await checkbox.click()
-            log.info("✅ 已点击 Cloudflare checkbox，等待验证...")
-            await asyncio.sleep(3)
-            body2 = await get_text(tab)
-            if "email" in body2 or "登录" in body2 or "请输入邮箱" in body2:
-                log.info("✅ 点击后验证通过")
-                return True
-
-        except Exception as e:
-            log.info(f"第{i+1}s: {e}")
+            await asyncio.sleep(1)
+            log.info(f"等待CF验证... {i+1}s")
+            continue
 
         await asyncio.sleep(1)
     log.error("Cloudflare 验证超时")
@@ -259,7 +230,7 @@ async def fill_captcha(tab):
         await asyncio.sleep(1)
     return ""
 
-# ---------- Cookie 恢复 ----------
+# ---------- Cookie 管理 ----------
 async def try_restore_cookies(tab):
     cookies = load_cookies()
     if not cookies:
@@ -294,7 +265,7 @@ async def save_session_cookies(tab):
         log.warning(f"保存 Cookie 失败: {e}")
 
 # ---------- 登录 ----------
-async def login(browser, tab, max_retries=3):
+async def login(browser, tab, max_retries=2):
     if await try_restore_cookies(tab):
         return True
 
@@ -306,22 +277,10 @@ async def login(browser, tab, max_retries=3):
         except:
             await tab.go_to(LOGIN_URL)
 
-        cf_passed = False
-        for _w in range(15):
-            await asyncio.sleep(1)
-            body = await get_text(tab)
-            if "verify you are human" not in body.lower() and "cloudflare" not in body.lower():
-                cf_passed = True
-                break
-            log.info(f"等待CF验证... {_w+1}s")
-
-        if not cf_passed:
-            log.warning("pydoll bypass 未能自动过CF，尝试手动点击...")
-            success = await manual_cf_click(tab)
-            if not success:
-                log.error("Cloudflare 验证失败，截图后重试")
-                await take_screenshot(browser, tab, f"cf_fail_{attempt}")
-                continue
+        # 等待 CF 验证通过
+        if not await handle_cf_verification(tab, timeout=15):
+            log.error("CF 验证失败，重试")
+            continue
 
         # 填写邮箱密码
         try:
@@ -349,7 +308,7 @@ async def login(browser, tab, max_retries=3):
         except Exception:
             login_btn = await tab.find(tag_name="button", text="登录", timeout=5)
         await login_btn.click()
-        log.info("已点击登录，立即检查跳转...")
+        log.info("已点击登录，检查跳转...")
 
         if await wait_for_url_contains(tab, "/clientarea", 8):
             log.info("✅ 登录成功")
@@ -369,15 +328,39 @@ async def sign(browser, tab):
     except:
         await tab.go_to(SIGN_PAGE)
 
-    if not await wait_for_element_by_text(tab, "我要签到", 10):
-        log.info("可能已经签到过了")
+    # 检测是否出现 CF 验证
+    body = await get_text(tab)
+    if "cloudflare" in body.lower() or "verify you are human" in body.lower():
+        log.info("签到页出现 CF 验证，等待完成...")
+        if not await handle_cf_verification(tab, timeout=15):
+            log.error("签到页 CF 验证失败")
+            await take_screenshot(browser, tab, "02_cf_fail")
+            return None, None
+
+    # 重新检查页面内容
+    await asyncio.sleep(2)
+    body = await get_text(tab)
+    url = await get_url(tab)
+
+    # 判断是否真的已签到
+    if "今日已签到" in body or await tab.find(tag_name="button", text="我要签到", timeout=3, raise_exc=False) is None:
+        # 尝试提取现有余额
+        bal = re.search(r'账户余额剩余\s*([\d.]+)\s*积分', body)
+        balance = bal.group(1) if bal else None
+        log.info("已经签到过了（或按钮不存在）")
         await take_screenshot(browser, tab, "02_sign_skip")
-        return None
+        return balance, None
 
-    btn = await tab.find(tag_name="button", text="我要签到", timeout=5)
-    await btn.click()
+    # 点击签到按钮
+    try:
+        btn = await tab.find(tag_name="button", text="我要签到", timeout=5)
+        await btn.click()
+    except:
+        log.info("找不到签到按钮，可能已签到")
+        await take_screenshot(browser, tab, "02_sign_skip")
+        return None, None
+
     await asyncio.sleep(1)
-
     text = await get_text(tab)
     match = re.search(r'请计算[：:]\s*(\d+)\s*([+\-*/])\s*(\d+)', text)
     if match:
@@ -407,7 +390,7 @@ async def sign(browser, tab):
     await take_screenshot(browser, tab, "03_sign_complete")
     text = await get_text(tab)
     bal = re.search(r'账户余额剩余\s*([\d.]+)\s*积分', text)
-    return bal.group(1) if bal else None
+    return (bal.group(1) if bal else None), None
 
 # ---------- 续费 ----------
 async def renew(browser, tab):
@@ -417,14 +400,14 @@ async def renew(browser, tab):
     text = await get_text(tab)
     match = re.search(r'(\d{4}-\d{2}-\d{2})', text)
     if not match:
-        return None, None, False
+        return False, None, None
     expiry_str = match.group(1)
     expiry = datetime.strptime(expiry_str, "%Y-%m-%d")
     remain = (expiry - datetime.now()).days
     log.info(f"到期: {expiry_str}，剩余 {remain} 天")
     if remain > 1:
         log.info("暂不续费")
-        return expiry_str, remain, False
+        return False, expiry_str, remain
 
     try:
         renew_btn = await tab.find(tag_name="button", text="续费", timeout=5)
@@ -438,10 +421,10 @@ async def renew(browser, tab):
         await ok.click()
         log.info("✅ 续费完成")
         await take_screenshot(browser, tab, "04_renew_complete")
-        return expiry_str, remain, True
+        return True, expiry_str, remain
     except:
         log.warning("续费流程异常")
-        return expiry_str, remain, False
+        return False, expiry_str, remain
 
 # ---------- 主流程 ----------
 async def main():
@@ -451,8 +434,17 @@ async def main():
             wxpush("❌ 登录失败")
             return
 
-        balance = await sign(browser, tab)
-        expiry_str, remain, renewed = await renew(browser, tab)
+        balance, _ = await sign(browser, tab)
+        renewed, expiry_str, remain = await renew(browser, tab)
+
+        # 如果签到没有拿到余额，尝试从续费页面（用户中心）获取
+        if balance is None and expiry_str:
+            await tab.go_to(USER_CENTER)
+            await asyncio.sleep(2)
+            text = await get_text(tab)
+            bal = re.search(r'账户余额剩余\s*([\d.]+)\s*积分', text)
+            if bal:
+                balance = bal.group(1)
 
         lines = ["✅ 签到成功"]
         if balance is not None:
