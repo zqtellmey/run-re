@@ -393,9 +393,27 @@ async def renew(browser, tab):
     text = await get_text(tab)
     await take_screenshot(browser, tab, "03b_service_page")
 
-    match = re.search(r'(\d{4}-\d{2}-\d{2})', text)
+    # 精确匹配"到期时间"字段，避免误读"订购日期"等其他日期
+    match = re.search(r'到期时间[：:\s]*(\d{4}-\d{2}-\d{2})', text)
     if not match:
-        log.info("未找到到期日，页面片段: " + text[:300])
+        # 兜底：用 JS 直接读到期时间单元格
+        try:
+            result = await tab.execute_script("""
+                var els = document.querySelectorAll('td, span, div');
+                for (var el of els) {
+                    var t = el.innerText || '';
+                    var m = t.match(/20\\d\\d-\\d{2}-\\d{2}/);
+                    if (m && el.closest('tr')) { return m[0]; }
+                }
+                return null;
+            """)
+            val = result.get("result", {}).get("result", {}).get("value") if isinstance(result, dict) else result
+            if val:
+                match = re.match(r'(\d{4}-\d{2}-\d{2})', val)
+        except Exception:
+            pass
+    if not match:
+        log.info("未找到到期日，页面片段: " + text[:500])
         return False, None, None
 
     expiry_str = match.group(1)
@@ -489,13 +507,30 @@ async def main():
         balance = await sign(browser, tab)
         renewed, expiry_str, remain = await renew(browser, tab)
 
-        if balance is None and expiry_str:
-            await tab.go_to(USER_CENTER)
+        # 续费后重新读最新积分和到期日
+        try:
+            await tab.go_to(SERVICE_PAGE)
             await asyncio.sleep(2)
-            text = await get_text(tab)
-            bal = re.search(r'账户余额剩余\s*([\d.]+)\s*积分', text)
-            if bal:
-                balance = bal.group(1)
+            svc_text = await get_text(tab)
+            # 重新读到期日（续费后到期日会更新）
+            m_exp = re.search(r'到期时间[：:\s]*(\d{4}-\d{2}-\d{2})', svc_text)
+            if m_exp:
+                expiry_str = m_exp.group(1)
+                log.info(f"续费后最新到期日: {expiry_str}")
+        except Exception as e:
+            log.warning(f"续费后读取到期日失败: {e}")
+
+        # 读积分（签到页有余额）
+        if balance is None:
+            try:
+                await tab.go_to(SIGN_PAGE)
+                await asyncio.sleep(2)
+                sign_text = await get_text(tab)
+                bal = re.search(r'账户余额剩余\s*([\d.]+)\s*积分', sign_text)
+                if bal:
+                    balance = bal.group(1)
+            except Exception as e:
+                log.warning(f"读取积分失败: {e}")
 
         lines = ["✅ 签到成功"]
         if balance is not None:
