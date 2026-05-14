@@ -13,6 +13,7 @@ PASSWORD = os.environ["PASSWORD"]
 BASE_URL = "https://run.freecloud.ltd"
 LOGIN_URL = f"{BASE_URL}/login"
 USER_CENTER = f"{BASE_URL}/clientarea"
+SERVICE_PAGE = f"{BASE_URL}/service?groupid=305"   # 云服务器列表页
 SIGN_PAGE = f"{BASE_URL}/addons?_plugin=5&controller=index&action=index"
 
 SCREENSHOT_DIR = Path("./screenshots")
@@ -366,39 +367,115 @@ async def sign(browser, tab):
     bal = re.search(r'账户余额剩余\s*([\d.]+)\s*积分', text)
     return bal.group(1) if bal else None
 
+# ---------- 续费辅助：JS 点击指定选择器 ----------
+async def _js_click(tab, selector, desc=""):
+    try:
+        result = await tab.execute_script(f"""
+            var el = document.querySelector('{selector}');
+            if (el) {{ el.click(); return true; }}
+            return false;
+        """)
+        val = result.get("result", {}).get("result", {}).get("value") if isinstance(result, dict) else result
+        if val:
+            log.info(f"JS 点击成功: {desc or selector}")
+            return True
+    except Exception as e:
+        log.warning(f"JS 点击失败 [{desc}]: {e}")
+    return False
+
 # ---------- 续费 ----------
 async def renew(browser, tab):
     log.info("检查续费...")
-    await tab.go_to(USER_CENTER)
-    await asyncio.sleep(2)
+
+    # 去云服务器列表页（不是 clientarea，clientarea 没有到期日）
+    await tab.go_to(SERVICE_PAGE)
+    await asyncio.sleep(3)
     text = await get_text(tab)
+    await take_screenshot(browser, tab, "03b_service_page")
+
     match = re.search(r'(\d{4}-\d{2}-\d{2})', text)
     if not match:
-        log.info("未找到到期日")
+        log.info("未找到到期日，页面片段: " + text[:300])
         return False, None, None
+
     expiry_str = match.group(1)
     expiry = datetime.strptime(expiry_str, "%Y-%m-%d")
     remain = (expiry - datetime.now()).days
     log.info(f"到期: {expiry_str}，剩余 {remain} 天")
-    if remain > 1:
-        log.info("暂不续费")
+
+    # 到期前两天（remain <= 2）才续费
+    if remain > 2:
+        log.info(f"距到期还有 {remain} 天，暂不续费")
         return False, expiry_str, remain
 
-    try:
-        renew_btn = await tab.find(tag_name="button", text="续费", timeout=5)
-        await renew_btn.click()
-        await asyncio.sleep(1)
-        await tab.find(tag_name="button", text="立即续费", timeout=5).click()
-        await asyncio.sleep(1)
-        await tab.find(tag_name="button", text="立即支付", timeout=5).click()
-        await asyncio.sleep(1)
-        ok = await tab.find(tag_name="button", text="确定", timeout=3)
-        await ok.click()
+    log.info(f"剩余 {remain} 天，开始续费...")
+
+    # ── 第1步：勾选服务行的 checkbox ──────────────────────────────────────────
+    # checkbox 在表格行头部，class 含 custom-control-input，id=customCheck 开头
+    checked = await _js_click(tab, "input#customCheck", "全选checkbox")
+    if not checked:
+        # 退路：点第一个 custom-control-input
+        checked = await _js_click(tab, "input.custom-control-input", "行checkbox")
+    await asyncio.sleep(1)
+    await take_screenshot(browser, tab, "04a_checked")
+
+    # ── 第2步：点底部"续费"按钮（id=readBtn） ────────────────────────────────
+    clicked = await _js_click(tab, "button#readBtn", "续费按钮#readBtn")
+    if not clicked:
+        clicked = await _js_click(tab, "button.btn-outline-primary", "续费按钮outline")
+    if not clicked:
+        log.warning("找不到续费按钮，放弃续费")
+        await take_screenshot(browser, tab, "04b_no_renew_btn")
+        return False, expiry_str, remain
+    await asyncio.sleep(3)
+    await take_screenshot(browser, tab, "04b_after_renew_click")
+
+    # 应该跳转到 /mulitrenew 批量续费页
+    current_url = await get_url(tab)
+    log.info(f"当前页面: {current_url}")
+
+    # ── 第3步：批量续费页点"立即续费"（type=submit, class含xfSubmit） ─────────
+    clicked2 = await _js_click(tab, "button.xfSubmit", "立即续费 xfSubmit")
+    if not clicked2:
+        clicked2 = await _js_click(tab, "button[type='submit']", "立即续费 submit")
+    await asyncio.sleep(3)
+    await take_screenshot(browser, tab, "04c_after_xfsubmit")
+
+    # 应该跳转到 /viewbilling 账单页
+    current_url = await get_url(tab)
+    log.info(f"当前页面: {current_url}")
+
+    # ── 第4步：账单页点"立即支付"（id=payamount） ────────────────────────────
+    clicked3 = await _js_click(tab, "button#payamount", "立即支付 #payamount")
+    if not clicked3:
+        clicked3 = await _js_click(tab, "button.btnWidth", "立即支付 btnWidth")
+    await asyncio.sleep(3)
+    await take_screenshot(browser, tab, "04d_after_payamount")
+
+    # ── 第5步：弹窗里的"立即支付"（class含pay-now，onclick=payNow()） ─────────
+    clicked4 = await _js_click(tab, "button.pay-now", "弹窗立即支付 pay-now")
+    if not clicked4:
+        # 直接调用 payNow()
+        try:
+            await tab.execute_script("payNow();")
+            log.info("直接调用 payNow()")
+            clicked4 = True
+        except Exception as e:
+            log.warning(f"payNow() 调用失败: {e}")
+    await asyncio.sleep(3)
+    await take_screenshot(browser, tab, "04e_after_paynow")
+
+    current_url = await get_url(tab)
+    log.info(f"续费后页面: {current_url}")
+
+    # 判断是否续费成功（跳转回服务列表或出现成功字样）
+    final_text = await get_text(tab)
+    if "success" in final_text.lower() or "成功" in final_text or "/service" in current_url:
         log.info("✅ 续费完成")
-        await take_screenshot(browser, tab, "04_renew_complete")
+        await take_screenshot(browser, tab, "04f_renew_complete")
         return True, expiry_str, remain
-    except:
-        log.warning("续费流程异常")
+    else:
+        log.warning("续费流程可能未完成，请查看截图")
         return False, expiry_str, remain
 
 # ---------- 主流程 ----------
@@ -429,7 +506,7 @@ async def main():
                 lines.append("✅ 已自动续期")
             else:
                 renew_date = (
-                    datetime.strptime(expiry_str, "%Y-%m-%d") - timedelta(days=1)
+                    datetime.strptime(expiry_str, "%Y-%m-%d") - timedelta(days=2)
                 ).strftime("%Y-%m-%d")
                 lines.append(f"不用续期，等到 {renew_date} 再续期")
         wxpush("\n".join(lines))
