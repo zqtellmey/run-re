@@ -147,6 +147,7 @@ async def create_browser():
     opts.add_argument("--disable-password-generation")
     opts.add_argument("--password-store=basic")
     opts.add_argument("--use-mock-keychain")
+    opts.add_argument("--disable-features=PasswordManager,AutofillEnableAccountStorageForScreenReader")
 
     opts.browser_preferences = {
         "credentials_enable_service": False,
@@ -355,26 +356,33 @@ async def sign(browser, tab):
         log.info("已点击验证答案，等待弹窗...")
         await asyncio.sleep(2)
 
+        # layui 弹窗确定按钮是 <a class="layui-layer-btn0">，不是 <button>
+        # 统一用这个 JS 函数点击，兼容 a/button 两种写法
+        async def click_layui_ok(desc="确定"):
+            result = await tab.execute_script("""
+                // 优先点 layui 弹窗的确定 <a>
+                var a = document.querySelector('a.layui-layer-btn0');
+                if (a) { a.click(); return 'layui-a'; }
+                // 其次找可见的 <button> 含"确定"
+                var btns = document.querySelectorAll('button');
+                for (var b of btns) {
+                    if (b.innerText.trim() === '确定' && b.offsetParent !== null) {
+                        b.click(); return 'button';
+                    }
+                }
+                return null;
+            """)
+            val = result.get("result", {}).get("result", {}).get("value") if isinstance(result, dict) else result
+            log.info(f"点击{desc}: {val}")
+            return bool(val)
+
         # ── 弹窗1：验证成功，您可以继续签到！→ 必须点确定才能触发签到 ──
         clicked_verify_ok = False
         for _ in range(12):
             body = await get_text(tab)
             if "验证成功" in body or "继续签到" in body:
                 log.info("检测到验证成功弹窗，点击确定...")
-                try:
-                    ok_btn = await tab.find(tag_name="button", text="确定", timeout=3)
-                    await ok_btn.click()
-                    clicked_verify_ok = True
-                    log.info("已点击验证弹窗确定")
-                except Exception as e:
-                    log.warning(f"find确定失败，尝试JS: {e}")
-                    await tab.execute_script("""
-                        var btns = document.querySelectorAll('button');
-                        for (var b of btns) {
-                            if (b.innerText.trim() === '确定') { b.click(); break; }
-                        }
-                    """)
-                    clicked_verify_ok = True
+                clicked_verify_ok = await click_layui_ok("验证弹窗确定")
                 await asyncio.sleep(1.5)
                 break
             await asyncio.sleep(0.5)
@@ -386,16 +394,7 @@ async def sign(browser, tab):
             body = await get_text(tab)
             if "签到成功" in body:
                 log.info("检测到签到成功弹窗，点击确定...")
-                try:
-                    ok_btn2 = await tab.find(tag_name="button", text="确定", timeout=3)
-                    await ok_btn2.click()
-                except Exception:
-                    await tab.execute_script("""
-                        var btns = document.querySelectorAll('button');
-                        for (var b of btns) {
-                            if (b.innerText.trim() === '确定') { b.click(); break; }
-                        }
-                    """)
+                await click_layui_ok("签到成功确定")
                 await asyncio.sleep(1.5)
                 break
             await asyncio.sleep(0.5)
