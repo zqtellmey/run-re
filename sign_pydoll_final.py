@@ -330,8 +330,9 @@ async def sign(browser, tab):
     btn = await tab.find(tag_name="button", text="我要签到", timeout=5)
     await btn.click()
     log.info("已点击'我要签到'")
-    await asyncio.sleep(1)
+    await asyncio.sleep(1.5)
 
+    # 解答数学验证题
     text = await get_text(tab)
     match = re.search(r'请计算[：:]\s*(\d+)\s*([+\-*/])\s*(\d+)', text)
     if match:
@@ -351,21 +352,66 @@ async def sign(browser, tab):
         await ans_el.type_text(result_str, humanize=True)
         ver_btn = await tab.find(tag_name="button", text="验证答案", timeout=5)
         await ver_btn.click()
-        await asyncio.sleep(1)
+        log.info("已点击验证答案，等待弹窗...")
+        await asyncio.sleep(2)
 
-    for _ in range(2):
-        try:
-            ok = await tab.find(tag_name="button", text="确定", timeout=2)
-            await ok.click()
+        # ── 弹窗1：验证成功，您可以继续签到！→ 必须点确定才能触发签到 ──
+        clicked_verify_ok = False
+        for _ in range(12):
+            body = await get_text(tab)
+            if "验证成功" in body or "继续签到" in body:
+                log.info("检测到验证成功弹窗，点击确定...")
+                try:
+                    ok_btn = await tab.find(tag_name="button", text="确定", timeout=3)
+                    await ok_btn.click()
+                    clicked_verify_ok = True
+                    log.info("已点击验证弹窗确定")
+                except Exception as e:
+                    log.warning(f"find确定失败，尝试JS: {e}")
+                    await tab.execute_script("""
+                        var btns = document.querySelectorAll('button');
+                        for (var b of btns) {
+                            if (b.innerText.trim() === '确定') { b.click(); break; }
+                        }
+                    """)
+                    clicked_verify_ok = True
+                await asyncio.sleep(1.5)
+                break
             await asyncio.sleep(0.5)
-        except:
-            break
+        if not clicked_verify_ok:
+            log.warning("未检测到验证成功弹窗，继续等待签到结果")
 
-    log.info("签到完成")
+        # ── 弹窗2：签到成功弹窗 → 点确定 ──
+        for _ in range(12):
+            body = await get_text(tab)
+            if "签到成功" in body:
+                log.info("检测到签到成功弹窗，点击确定...")
+                try:
+                    ok_btn2 = await tab.find(tag_name="button", text="确定", timeout=3)
+                    await ok_btn2.click()
+                except Exception:
+                    await tab.execute_script("""
+                        var btns = document.querySelectorAll('button');
+                        for (var b of btns) {
+                            if (b.innerText.trim() === '确定') { b.click(); break; }
+                        }
+                    """)
+                await asyncio.sleep(1.5)
+                break
+            await asyncio.sleep(0.5)
+
+    log.info("签到流程完成")
     await take_screenshot(browser, tab, "03_sign_complete")
+
+    # 刷新签到页，重新读取最新积分（签到后积分会增加，必须刷新才能拿到新值）
+    await asyncio.sleep(1)
+    await tab.go_to(SIGN_PAGE)
+    await asyncio.sleep(2)
     text = await get_text(tab)
     bal = re.search(r'账户余额剩余\s*([\d.]+)\s*积分', text)
-    return bal.group(1) if bal else None
+    balance = bal.group(1) if bal else None
+    log.info(f"签到后最新积分: {balance}")
+    return balance
 
 # ---------- 续费辅助：JS 点击指定选择器 ----------
 async def _js_click(tab, selector, desc=""):
@@ -396,20 +442,45 @@ async def renew(browser, tab):
     # 精确匹配"到期时间"字段，避免误读"订购日期"等其他日期
     match = re.search(r'到期时间[：:\s]*(\d{4}-\d{2}-\d{2})', text)
     if not match:
-        # 兜底：用 JS 直接读到期时间单元格
+        # 兜底：JS 按表头定位"到期时间"列，读对应 td 的日期
         try:
             result = await tab.execute_script("""
-                var els = document.querySelectorAll('td, span, div');
-                for (var el of els) {
-                    var t = el.innerText || '';
-                    var m = t.match(/20\\d\\d-\\d{2}-\\d{2}/);
-                    if (m && el.closest('tr')) { return m[0]; }
+                // 方法1：找表头含"到期"的列，读同列 td
+                var tables = document.querySelectorAll('table');
+                for (var tbl of tables) {
+                    var headers = tbl.querySelectorAll('th');
+                    var colIdx = -1;
+                    for (var i = 0; i < headers.length; i++) {
+                        if (headers[i].innerText.indexOf('到期') !== -1) {
+                            colIdx = i; break;
+                        }
+                    }
+                    if (colIdx >= 0) {
+                        var rows = tbl.querySelectorAll('tbody tr');
+                        for (var row of rows) {
+                            var tds = row.querySelectorAll('td');
+                            if (tds[colIdx]) {
+                                var t = tds[colIdx].innerText.trim();
+                                var m = t.match(/20\\d\\d-\\d{2}-\\d{2}/);
+                                if (m) return m[0];
+                            }
+                        }
+                    }
+                }
+                // 方法2：找任意含日期的 td，且同行有"已激活"状态
+                var rows = document.querySelectorAll('tr');
+                for (var row of rows) {
+                    var rowText = row.innerText || '';
+                    if (rowText.indexOf('已激活') !== -1 || rowText.indexOf('Active') !== -1) {
+                        var m = rowText.match(/20\\d\\d-\\d{2}-\\d{2}/);
+                        if (m) return m[0];
+                    }
                 }
                 return null;
             """)
             val = result.get("result", {}).get("result", {}).get("value") if isinstance(result, dict) else result
             if val:
-                match = re.match(r'(\d{4}-\d{2}-\d{2})', val)
+                match = re.match(r'(\d{4}-\d{2}-\d{2})', str(val))
         except Exception:
             pass
     if not match:
@@ -507,20 +578,58 @@ async def main():
         balance = await sign(browser, tab)
         renewed, expiry_str, remain = await renew(browser, tab)
 
-        # 续费后重新读最新积分和到期日
-        try:
-            await tab.go_to(SERVICE_PAGE)
-            await asyncio.sleep(2)
-            svc_text = await get_text(tab)
-            # 重新读到期日（续费后到期日会更新）
-            m_exp = re.search(r'到期时间[：:\s]*(\d{4}-\d{2}-\d{2})', svc_text)
-            if m_exp:
-                expiry_str = m_exp.group(1)
-                log.info(f"续费后最新到期日: {expiry_str}")
-        except Exception as e:
-            log.warning(f"续费后读取到期日失败: {e}")
+        # 续费后重新读最新到期日（续费会改变到期日，必须重新查）
+        if renewed:
+            try:
+                await tab.go_to(SERVICE_PAGE)
+                await asyncio.sleep(3)
+                svc_text = await get_text(tab)
+                # 先尝试文本匹配
+                m_exp = re.search(r'到期时间[：:\s]*(\d{4}-\d{2}-\d{2})', svc_text)
+                if not m_exp:
+                    # JS 按表头/已激活行读日期
+                    result = await tab.execute_script("""
+                        var tables = document.querySelectorAll('table');
+                        for (var tbl of tables) {
+                            var headers = tbl.querySelectorAll('th');
+                            var colIdx = -1;
+                            for (var i = 0; i < headers.length; i++) {
+                                if (headers[i].innerText.indexOf('到期') !== -1) {
+                                    colIdx = i; break;
+                                }
+                            }
+                            if (colIdx >= 0) {
+                                var rows = tbl.querySelectorAll('tbody tr');
+                                for (var row of rows) {
+                                    var tds = row.querySelectorAll('td');
+                                    if (tds[colIdx]) {
+                                        var t = tds[colIdx].innerText.trim();
+                                        var m = t.match(/20\\d\\d-\\d{2}-\\d{2}/);
+                                        if (m) return m[0];
+                                    }
+                                }
+                            }
+                        }
+                        var rows = document.querySelectorAll('tr');
+                        for (var row of rows) {
+                            var rowText = row.innerText || '';
+                            if (rowText.indexOf('已激活') !== -1 || rowText.indexOf('Active') !== -1) {
+                                var m = rowText.match(/20\\d\\d-\\d{2}-\\d{2}/);
+                                if (m) return m[0];
+                            }
+                        }
+                        return null;
+                    """)
+                    val = result.get("result", {}).get("result", {}).get("value") if isinstance(result, dict) else result
+                    if val:
+                        m_exp = re.match(r'(\d{4}-\d{2}-\d{2})', str(val))
+                if m_exp:
+                    expiry_str = m_exp.group(1)
+                    log.info(f"续费后最新到期日: {expiry_str}")
+            except Exception as e:
+                log.warning(f"续费后读取到期日失败: {e}")
 
-        # 读积分（签到页有余额）
+        # 重新读最新积分（sign() 已经刷新过，但若 balance 仍为 None 再读一次）
         if balance is None:
             try:
                 await tab.go_to(SIGN_PAGE)
