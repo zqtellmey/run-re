@@ -1,8 +1,8 @@
 name: Freecloud 签到 (pydoll + V2Ray)
 
 on:
-  schedule:
-    - cron: '30 1 * * *'
+#  schedule:
+#    - cron: '30 1 * * *'
   workflow_dispatch:
 
 jobs:
